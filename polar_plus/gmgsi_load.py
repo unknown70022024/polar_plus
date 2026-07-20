@@ -100,6 +100,31 @@ def bt_to_density(vals: np.ndarray, is_pre_scaled: bool) -> np.ndarray:
     return _brightness_temp_to_density(vals)
 
 
+def post_process_density(density: np.ndarray,
+                         threshold: int = 20,
+                         gamma: float = 0.75) -> np.ndarray:
+    """
+    Remove low-density noise and boost cloud contrast.
+
+    threshold: pixel values below this become 0 (clear sky).
+               Atmospheric background noise typically registers as 0-30/255.
+    gamma:     < 1.0 suppresses thin haze while preserving thick cloud brightness.
+    """
+    # 1. Threshold — kill atmospheric noise in clear areas
+    density = np.where(density < threshold, 0, density)
+
+    # 2. Gamma correction — darken low-density haze, keep dense clouds bright
+    normalized = density.astype(np.float32) / 255.0
+    corrected = np.power(normalized, gamma) * 255.0
+    density = np.clip(corrected, 0, 255).astype(np.uint8)
+
+    logger.info(
+        f"Post-process: threshold={threshold}, gamma={gamma}, "
+        f"zeros={np.sum(density == 0) / density.size * 100:.1f}%"
+    )
+    return density
+
+
 def load_core_density(target_w: int = 5000, max_days_back: int = 14) -> tuple:
     """
     主入口：查找最新 GMGSI -> 下载 -> BT转密度 -> padding 至 90N-90S

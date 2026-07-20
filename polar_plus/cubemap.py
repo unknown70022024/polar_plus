@@ -32,7 +32,7 @@ def direction_to_equirect(dx: float, dy: float, dz: float,
                           src_w: int, src_h: int,
                           lon_offset_deg: float = 0.0):
     lat = math.asin(max(-1.0, min(1.0, dy)))
-    lon = math.atan2(-dx, dz) + math.radians(lon_offset_deg)
+    lon = math.atan2(dx, dz) + math.radians(lon_offset_deg)
     ix = (lon / (2 * math.pi) + 0.5) * src_w
     iy = (0.5 - lat / math.pi) * src_h
     ix = ix % src_w

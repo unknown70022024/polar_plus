@@ -197,6 +197,13 @@ def fill_polar_caps(core_density: np.ndarray,
     else:
         logger.warning(f"Skip LUT ({len(sv)} samples)")
 
+    # --- 5b. 背景减法：估算并移除 SSEC 的非零背景偏移 ---
+    overlap_mask = (lat_grid >= 55) & (lat_grid <= 65)
+    ssec_bg = int(np.percentile(ssec[overlap_mask], 5))
+    if ssec_bg > 0:
+        ssec = np.clip(ssec.astype(np.int16) - ssec_bg, 0, 255).astype(np.uint8)
+        logger.info(f"SSEC bg subtract: floor={ssec_bg}, zeros={(ssec==0).mean()*100:.1f}%")
+
     # --- 6. 羽化融合 ---
     logger.info("Feathering...")
     r = core_density.copy()

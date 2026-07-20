@@ -22,7 +22,7 @@ from PIL import Image
 
 from polar_plus.config import OUTPUT_DIR, FACE_SIZE, LON_OFFSET, TARGET_W, TARGET_H
 from polar_plus.cubemap import equirect_to_cubemap
-from polar_plus.gmgsi_load import load_core_density
+from polar_plus.gmgsi_load import load_core_density, post_process_density
 from polar_plus.capfill import fill_polar_caps
 
 logging.basicConfig(
@@ -36,7 +36,7 @@ def save_faces(faces: dict, tiles_dir: Path):
     tiles_dir.mkdir(parents=True, exist_ok=True)
     for face_name, face_img in faces.items():
         path = tiles_dir / f"{face_name}.jpg"
-        face_img.convert('RGB').save(path, quality=85, optimize=True)
+        face_img.save(path, quality=95, optimize=True, subsampling=0)
         size_kb = path.stat().st_size / 1024
         print(f"  [SAVE] {path.name} ({size_kb:.0f} KB)")
 
@@ -70,6 +70,10 @@ def run_pipeline(api_key: str = ""):
           f"min={full_density.min()}, max={full_density.max()}, "
           f"mean={full_density.mean():.1f}, "
           f"zeros={np.sum(full_density==0)/full_density.size*100:.1f}%")
+
+    # Step 2.5: 密度后处理（阈值去噪 + Gamma 校正）
+    print(f"\n[2.5/4] Post-processing density (threshold + gamma)...")
+    full_density = post_process_density(full_density, threshold=20, gamma=0.75)
 
     # Step 3: Cubemap
     print(f"\n[3/4] Equirect to cubemap...")
