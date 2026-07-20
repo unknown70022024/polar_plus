@@ -36,7 +36,7 @@ def save_faces(faces: dict, tiles_dir: Path):
     tiles_dir.mkdir(parents=True, exist_ok=True)
     for face_name, face_img in faces.items():
         path = tiles_dir / f"{face_name}.jpg"
-        face_img.save(path, quality=95, optimize=True, subsampling=0)
+        face_img.convert('RGB').save(path, quality=95, optimize=True, subsampling=0)
         size_kb = path.stat().st_size / 1024
         print(f"  [SAVE] {path.name} ({size_kb:.0f} KB)")
 
