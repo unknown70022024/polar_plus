@@ -1,23 +1,28 @@
 #!/usr/bin/env python3
 """
-polar_plus/fetch_storms.py — Fetch real-time lightning strikes via MQTT relay.
+polar_plus/fetch_storms.py — Download lightning strikes from limap.org archive.
 
-Connects to the public Blitzortung MQTT broker, subscribes to global
-geo/# topics, collects strikes for a configurable duration, grid-dedup,
-and outputs storms.json for the Android live wallpaper.
+Fetches recent strike data (last 3 hours) from Blitzortung's official
+data archive at limap.org via plain HTTP GET. No credentials required.
 
-MQTT broker: blitzortung.ha.sed.pl:1883 (public, no auth required)
+Data is organized by container (region) and 10-minute intervals:
+    https://limap.org/{container}/{year}/{month}/{day}/{hour}/{10min}.json
 
-Fallback: uses DEFAULT_LOCATIONS if MQTT broker is unreachable.
+Containers covering the globe: C1-C7, C10, C18, C19
+
+Output: {OUTPUT_DIR}/latest/storms.json  →  [{"lat":34.0,"lng":-118.0}, ...]
 """
 
 import json
 import logging
 import math
 import os
+import random
 import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
 
 logging.basicConfig(
     level=logging.INFO,
@@ -29,13 +34,27 @@ logger = logging.getLogger("fetch_storms")
 # Configuration
 # ---------------------------------------------------------------------------
 
-MQTT_BROKER = os.environ.get("MQTT_BROKER", "blitzortung.ha.sed.pl")
-MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883"))
-COLLECT_SECONDS = int(os.environ.get("STORM_COLLECT_SECS", "60"))
-GRID_DEG = 1.0  # Dedup grid cell size in degrees (≈ 111 km at equator)
-MAX_STRIKES = 2000  # Cap output for mobile app memory
+ARCHIVE_BASE = "https://limap.org"
 
-# Default locations when MQTT is unavailable (globally distributed major cities)
+# Geographic containers (Blitzortung regions)
+CONTAINERS = [
+    "C1",   # Europe 1 (Germany server)
+    "C2",   # Oceania
+    "C3",   # North America 1 (Germany server)
+    "C4",   # Asia
+    "C5",   # Africa
+    "C6",   # South America
+    "C7",   # Japan
+    "C10",  # North America 2 (Finland server)
+    "C18",  # Europe 2 (Finland server)
+    "C19",  # Europe 3 (Finland server)
+]
+
+LOOKBACK_HOURS = 3
+GRID_DEG = 1.0     # Dedup grid cell ≈ 111 km at equator
+MAX_STRIKES = 2000
+
+# Default locations if archive is unreachable
 DEFAULT_LOCATIONS = [
     {"lat": 34.05, "lng": -118.24}, {"lat": -33.87, "lng": 151.21},
     {"lat": 51.51, "lng": -0.13}, {"lat": 35.68, "lng": 139.76},
@@ -64,59 +83,80 @@ def grid_key(lat: float, lng: float) -> tuple:
     return (int(math.floor(lat / GRID_DEG)), int(math.floor(lng / GRID_DEG)))
 
 
-def fetch_via_mqtt(broker: str, port: int, collect_secs: int) -> list[dict]:
+def fetch_archive() -> list[dict] | None:
     """
-    Connect to MQTT broker, subscribe to global geo/# topics,
-    collect strikes for collect_secs, return deduped list.
+    Download recent strike data from limap.org for all containers.
+    Returns list of {"lat": float, "lng": float} dicts, or None on failure.
     """
-    try:
-        import paho.mqtt.client as mqtt
-    except ImportError:
-        logger.error("paho-mqtt not installed. Run: pip install paho-mqtt")
-        return None
+    now = datetime.now(timezone.utc)
+    # Get the most recent completed 10-minute interval
+    latest_minute = (now.minute // 10) * 10
+    latest_slot = now.replace(minute=latest_minute, second=0, microsecond=0)
 
     strikes = []
-    seen = set()
+    seen_grids = set()
+    total_bytes = 0
 
-    def on_message(client, userdata, msg):
+    # Fetch only the latest interval for each container (10 files total)
+    urls = []
+    for container in CONTAINERS:
+        url = (
+            f"{ARCHIVE_BASE}/{container}/"
+            f"{latest_slot.year}/{latest_slot.month:02d}/{latest_slot.day:02d}/"
+            f"{latest_slot.hour:02d}/{latest_slot.minute:02d}.json"
+        )
+        urls.append((container, url))
+
+    logger.info(f"Fetching {len(urls)} archive files from limap.org...")
+    t0 = time.time()
+
+    for container, url in urls:
         try:
-            data = json.loads(msg.payload.decode("utf-8", errors="replace"))
-            lat = float(data.get("lat", 0))
-            lng = float(data.get("lon", 0))
-            gk = grid_key(lat, lng)
-            if gk not in seen:
-                seen.add(gk)
-                strikes.append({"lat": lat, "lng": lng})
-        except (ValueError, TypeError, json.JSONDecodeError):
-            pass  # Skip malformed messages
+            req = Request(url)
+            req.add_header("User-Agent", "polar-plus/1.0 (Android live wallpaper)")
+            with urlopen(req, timeout=15) as resp:
+                if resp.status != 200:
+                    continue
+                body = resp.read()
+                total_bytes += len(body)
+                text = body.decode("utf-8", errors="replace")
 
-    client = mqtt.Client()
-    client.on_message = on_message
-    client.connect_async(broker, port, 10)
+            for line in text.strip().split("\n"):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                    lat = float(obj.get("lat", 0))
+                    lng = float(obj.get("lon", 0))
+                    gk = grid_key(lat, lng)
+                    if gk in seen_grids:
+                        continue
+                    seen_grids.add(gk)
+                    strikes.append({"lat": lat, "lng": lng})
+                except (ValueError, TypeError, json.JSONDecodeError):
+                    continue
+        except HTTPError as e:
+            if e.code != 404:  # 404 is normal — many 10-min slots are empty
+                logger.debug(f"  HTTP {e.code} for {container}")
+        except URLError:
+            pass  # Container server may be down
+        except Exception:
+            pass
 
-    logger.info(f"Connected to MQTT broker {broker}:{port}, subscribing geo/+/# ...")
-    client.subscribe("geo/+/#", qos=0)
-    client.loop_start()
-
-    deadline = time.time() + collect_secs
-    while time.time() < deadline:
-        time.sleep(0.5)
-        if len(strikes) % 100 == 0 and len(strikes) > 0:
-            logger.info(f"  Collected {len(strikes)} strikes so far...")
-
-    client.loop_stop()
-    client.disconnect()
-    logger.info(f"MQTT collection done: {len(strikes)} unique strikes in {collect_secs}s")
-    return strikes
+    elapsed = time.time() - t0
+    logger.info(
+        f"Downloaded {total_bytes / 1024:.0f} KB in {elapsed:.0f}s, "
+        f"{len(strikes)} unique strikes from {len(urls)} files"
+    )
+    return strikes if strikes else None
 
 
 def save_storms(strikes: list[dict], output_dir: Path):
-    """Write storms.json to output_dir/latest/."""
     latest_dir = output_dir / "latest"
     latest_dir.mkdir(parents=True, exist_ok=True)
 
     if len(strikes) > MAX_STRIKES:
-        import random
         strikes = random.sample(strikes, MAX_STRIKES)
 
     path = latest_dir / "storms.json"
@@ -130,11 +170,11 @@ def main():
         Path(__file__).resolve().parent / "output"
     )))
 
-    logger.info(f"Fetching lightning strikes via MQTT ({MQTT_BROKER}:{MQTT_PORT})...")
-    strikes = fetch_via_mqtt(MQTT_BROKER, MQTT_PORT, COLLECT_SECONDS)
+    logger.info("Fetching lightning strikes from limap.org archive...")
+    strikes = fetch_archive()
 
     if strikes is None or len(strikes) == 0:
-        logger.warning("MQTT fetch returned no data, using default locations")
+        logger.warning("Archive fetch returned no data, using default locations")
         strikes = DEFAULT_LOCATIONS
 
     save_storms(strikes, output_dir)

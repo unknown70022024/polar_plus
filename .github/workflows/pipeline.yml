@@ -28,7 +28,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install --upgrade pip
-          pip install boto3 numpy pillow xarray netCDF4 h5netcdf paho-mqtt
+          pip install boto3 numpy pillow xarray netCDF4 h5netcdf
 
       - name: Run polar_plus cloud pipeline
         run: python -m polar_plus.run
