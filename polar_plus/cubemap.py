@@ -71,7 +71,7 @@ def equirect_to_cubemap(src_data: np.ndarray,
             for fx in range(face_size):
                 u = (fx / face_size) * 2.0 - 1.0
                 dx, dy, dz = face_direction(fi, u, v)
-                ix, iy = direction_to_equirect(dz, dx, dy, src_w, src_h, lon_offset)
+                ix, iy = direction_to_equirect(dy, dz, dx, src_w, src_h, lon_offset)
                 if iy < 0 or iy >= src_h:
                     out[fy, fx] = 0
                 else:
