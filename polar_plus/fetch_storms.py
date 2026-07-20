@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """
-polar_plus/fetch_storms.py — Download lightning strikes from limap.org archive.
+polar_plus/fetch_storms.py — Download lightning strikes from original proxy server.
 
-Fetches recent strike data (last 3 hours) from Blitzortung's official
-data archive at limap.org via plain HTTP GET. No credentials required.
+Primary: weather-proxy.456544.xyz (protobuf format, still alive as of 2026-07)
+Fallback: Default city locations if the proxy goes offline.
 
-Data is organized by container (region) and 10-minute intervals:
-    https://limap.org/{container}/{year}/{month}/{day}/{hour}/{10min}.json
-
-Containers covering the globe: C1-C7, C10, C18, C19
+Protobuf wire format (manual parse, no library dependency):
+  message StormLocations { repeated LatLng locations = 1; }
+  message LatLng { float latDeg = 1; float lngDeg = 2; }
 
 Output: {OUTPUT_DIR}/latest/storms.json  →  [{"lat":34.0,"lng":-118.0}, ...]
 """
@@ -18,8 +17,7 @@ import logging
 import math
 import os
 import random
-import time
-from datetime import datetime, timezone, timedelta
+import struct
 from pathlib import Path
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
@@ -34,27 +32,13 @@ logger = logging.getLogger("fetch_storms")
 # Configuration
 # ---------------------------------------------------------------------------
 
-ARCHIVE_BASE = "https://limap.org"
+# Original proxy server (still serving real Blitzortung data as of 2026-07)
+ORIGINAL_STORMS_URL = "https://weather-proxy.456544.xyz/pixel/livewallpaper/myworld/storm_locations"
 
-# Geographic containers (Blitzortung regions)
-CONTAINERS = [
-    "C1",   # Europe 1 (Germany server)
-    "C2",   # Oceania
-    "C3",   # North America 1 (Germany server)
-    "C4",   # Asia
-    "C5",   # Africa
-    "C6",   # South America
-    "C7",   # Japan
-    "C10",  # North America 2 (Finland server)
-    "C18",  # Europe 2 (Finland server)
-    "C19",  # Europe 3 (Finland server)
-]
-
-LOOKBACK_HOURS = 3
 GRID_DEG = 1.0     # Dedup grid cell ≈ 111 km at equator
 MAX_STRIKES = 2000
 
-# Default locations if archive is unreachable
+# Default locations if all sources are unreachable
 DEFAULT_LOCATIONS = [
     {"lat": 34.05, "lng": -118.24}, {"lat": -33.87, "lng": 151.21},
     {"lat": 51.51, "lng": -0.13}, {"lat": 35.68, "lng": 139.76},
@@ -83,72 +67,80 @@ def grid_key(lat: float, lng: float) -> tuple:
     return (int(math.floor(lat / GRID_DEG)), int(math.floor(lng / GRID_DEG)))
 
 
-def fetch_archive() -> list[dict] | None:
+def fetch_protobuf_storms(url: str) -> list[dict] | None:
     """
-    Download recent strike data from limap.org for all containers.
-    Returns list of {"lat": float, "lng": float} dicts, or None on failure.
+    Download and parse protobuf-encoded storm locations from the original proxy.
+
+    Wire format (no protobuf library needed):
+      - Repeated field 1 (locations): tag=0x0A, wire_type=2 (length-delimited)
+        - field 1 (latDeg): tag=0x0D, wire_type=5 (fixed32/float, 4 bytes)
+        - field 2 (lngDeg): tag=0x15, wire_type=5 (fixed32/float, 4 bytes)
     """
-    now = datetime.now(timezone.utc)
-    # Get the most recent completed 10-minute interval
-    latest_minute = (now.minute // 10) * 10
-    latest_slot = now.replace(minute=latest_minute, second=0, microsecond=0)
+    try:
+        req = Request(url)
+        req.add_header("User-Agent", "polar-plus/1.0 (Android live wallpaper)")
+        with urlopen(req, timeout=15) as resp:
+            if resp.status != 200:
+                logger.warning(f"Original storms URL returned {resp.status}")
+                return None
+            data = resp.read()
+    except (HTTPError, URLError, OSError) as e:
+        logger.warning(f"Failed to download from original storms URL: {e}")
+        return None
 
     strikes = []
     seen_grids = set()
-    total_bytes = 0
+    pos = 0
 
-    # Fetch only the latest interval for each container (10 files total)
-    urls = []
-    for container in CONTAINERS:
-        url = (
-            f"{ARCHIVE_BASE}/{container}/"
-            f"{latest_slot.year}/{latest_slot.month:02d}/{latest_slot.day:02d}/"
-            f"{latest_slot.hour:02d}/{latest_slot.minute:02d}.json"
-        )
-        urls.append((container, url))
+    try:
+        while pos < len(data):
+            tag = data[pos]
+            pos += 1
+            field = tag >> 3
+            wtype = tag & 0x07
 
-    logger.info(f"Fetching {len(urls)} archive files from limap.org...")
-    t0 = time.time()
+            if field == 1 and wtype == 2:
+                # Read varint length
+                length = 0
+                shift = 0
+                while True:
+                    b = data[pos]
+                    pos += 1
+                    length |= (b & 0x7F) << shift
+                    if not (b & 0x80):
+                        break
+                    shift += 7
 
-    for container, url in urls:
-        try:
-            req = Request(url)
-            req.add_header("User-Agent", "polar-plus/1.0 (Android live wallpaper)")
-            with urlopen(req, timeout=15) as resp:
-                if resp.status != 200:
-                    continue
-                body = resp.read()
-                total_bytes += len(body)
-                text = body.decode("utf-8", errors="replace")
+                end = pos + length
+                lat = lng = None
 
-            for line in text.strip().split("\n"):
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                    lat = float(obj.get("lat", 0))
-                    lng = float(obj.get("lon", 0))
+                while pos < end:
+                    stag = data[pos]
+                    pos += 1
+                    sfield = stag >> 3
+                    swtype = stag & 0x07
+
+                    if sfield == 1 and swtype == 5:
+                        lat = struct.unpack('<f', data[pos:pos + 4])[0]
+                        pos += 4
+                    elif sfield == 2 and swtype == 5:
+                        lng = struct.unpack('<f', data[pos:pos + 4])[0]
+                        pos += 4
+                    else:
+                        # Unknown field — skip (shouldn't happen)
+                        break
+
+                if lat is not None and lng is not None:
                     gk = grid_key(lat, lng)
-                    if gk in seen_grids:
-                        continue
-                    seen_grids.add(gk)
-                    strikes.append({"lat": lat, "lng": lng})
-                except (ValueError, TypeError, json.JSONDecodeError):
-                    continue
-        except HTTPError as e:
-            if e.code != 404:  # 404 is normal — many 10-min slots are empty
-                logger.debug(f"  HTTP {e.code} for {container}")
-        except URLError:
-            pass  # Container server may be down
-        except Exception:
-            pass
+                    if gk not in seen_grids:
+                        seen_grids.add(gk)
+                        strikes.append({"lat": round(lat, 4), "lng": round(lng, 4)})
+            else:
+                break  # End of locations
+    except (IndexError, struct.error) as e:
+        logger.warning(f"Protobuf parse error: {e}")
 
-    elapsed = time.time() - t0
-    logger.info(
-        f"Downloaded {total_bytes / 1024:.0f} KB in {elapsed:.0f}s, "
-        f"{len(strikes)} unique strikes from {len(urls)} files"
-    )
+    logger.info(f"Original proxy: {len(strikes)} strikes parsed from {len(data)} bytes")
     return strikes if strikes else None
 
 
@@ -170,11 +162,13 @@ def main():
         Path(__file__).resolve().parent / "output"
     )))
 
-    logger.info("Fetching lightning strikes from limap.org archive...")
-    strikes = fetch_archive()
+    # Primary: original proxy server (real Blitzortung data in protobuf)
+    logger.info("Fetching lightning strikes from original proxy...")
+    strikes = fetch_protobuf_storms(ORIGINAL_STORMS_URL)
 
+    # Fallback: default city locations
     if strikes is None or len(strikes) == 0:
-        logger.warning("Archive fetch returned no data, using default locations")
+        logger.warning("Original proxy unavailable, using default locations")
         strikes = DEFAULT_LOCATIONS
 
     save_storms(strikes, output_dir)
