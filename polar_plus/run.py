@@ -73,7 +73,7 @@ def run_pipeline(api_key: str = ""):
 
     # Step 2.5: 密度后处理（阈值去噪 + Gamma 校正）
     print(f"\n[2.5/4] Post-processing density (threshold + gamma)...")
-    full_density = post_process_density(full_density, threshold=20, gamma=0.75)
+    full_density = post_process_density(full_density, threshold=10, gamma=0.5)
 
     # Step 3: Cubemap
     print(f"\n[3/4] Equirect to cubemap...")

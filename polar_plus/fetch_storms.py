@@ -1,27 +1,23 @@
 #!/usr/bin/env python3
 """
-polar_plus/fetch_storms.py — Fetch lightning strike data from Blitzortung.
+polar_plus/fetch_storms.py — Fetch real-time lightning strikes via MQTT relay.
 
-Fetches recent strikes from data.blitzortung.org (requires operator credentials
-set as BLITZORTUNG_AUTH env var) and converts them to a simple JSON array for
-the Android live wallpaper to consume.
+Connects to the public Blitzortung MQTT broker, subscribes to global
+geo/# topics, collects strikes for a configurable duration, grid-dedup,
+and outputs storms.json for the Android live wallpaper.
 
-Output: {OUTPUT_DIR}/latest/storms.json  →  [{"lat":34.0,"lng":-118.0}, ...]
+MQTT broker: blitzortung.ha.sed.pl:1883 (public, no auth required)
 
-If BLITZORTUNG_AUTH is not set, generates a placeholder file with hardcoded
-default locations so the pipeline does not fail while waiting for credentials.
+Fallback: uses DEFAULT_LOCATIONS if MQTT broker is unreachable.
 """
 
 import json
 import logging
 import math
 import os
-import sys
 import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from urllib.request import Request, urlopen
-from urllib.error import URLError, HTTPError
 
 logging.basicConfig(
     level=logging.INFO,
@@ -33,126 +29,85 @@ logger = logging.getLogger("fetch_storms")
 # Configuration
 # ---------------------------------------------------------------------------
 
-# Blitzortung protected data endpoint
-BLITZORTUNG_URL = (
-    "https://data.blitzortung.org/Data/Protected/last_strikes.php"
-    "?number=50000&sig=0"
-)
+MQTT_BROKER = os.environ.get("MQTT_BROKER", "blitzortung.ha.sed.pl")
+MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883"))
+COLLECT_SECONDS = int(os.environ.get("STORM_COLLECT_SECS", "60"))
+GRID_DEG = 1.0  # Dedup grid cell size in degrees (≈ 111 km at equator)
+MAX_STRIKES = 2000  # Cap output for mobile app memory
 
-# Grid dedup: merge strikes within GRID_DEG degrees into one
-GRID_DEG = 1.0  # ~111 km at equator
-
-# How far back to look (hours)
-LOOKBACK_HOURS = 3
-
-# Default locations when Blitzortung data is unavailable
-# (major cities roughly distributed around the globe)
+# Default locations when MQTT is unavailable (globally distributed major cities)
 DEFAULT_LOCATIONS = [
-    {"lat": 34.05, "lng": -118.24},
-    {"lat": -33.87, "lng": 151.21},
-    {"lat": 51.51, "lng": -0.13},
-    {"lat": 35.68, "lng": 139.76},
-    {"lat": -34.60, "lng": -58.38},
-    {"lat": 41.01, "lng": 28.98},
-    {"lat": 19.08, "lng": 72.88},
-    {"lat": -1.29, "lng": 36.82},
-    {"lat": 55.75, "lng": 37.62},
-    {"lat": -22.91, "lng": -43.20},
-    {"lat": 30.04, "lng": 31.24},
-    {"lat": -6.21, "lng": 106.85},
-    {"lat": 48.86, "lng": 2.35},
-    {"lat": -37.81, "lng": 144.96},
-    {"lat": 37.57, "lng": 126.98},
-    {"lat": 14.60, "lng": 120.98},
-    {"lat": -4.33, "lng": 15.31},
-    {"lat": 25.20, "lng": 55.27},
-    {"lat": 40.42, "lng": -3.70},
-    {"lat": 52.52, "lng": 13.41},
-    {"lat": 59.33, "lng": 18.07},
-    {"lat": 33.89, "lng": 35.50},
-    {"lat": -26.20, "lng": 28.05},
-    {"lat": 53.55, "lng": -113.49},
-    {"lat": 43.65, "lng": -79.38},
+    {"lat": 34.05, "lng": -118.24}, {"lat": -33.87, "lng": 151.21},
+    {"lat": 51.51, "lng": -0.13}, {"lat": 35.68, "lng": 139.76},
+    {"lat": -34.60, "lng": -58.38}, {"lat": 41.01, "lng": 28.98},
+    {"lat": 19.08, "lng": 72.88}, {"lat": -1.29, "lng": 36.82},
+    {"lat": 55.75, "lng": 37.62}, {"lat": -22.91, "lng": -43.20},
+    {"lat": 30.04, "lng": 31.24}, {"lat": -6.21, "lng": 106.85},
+    {"lat": 48.86, "lng": 2.35}, {"lat": -37.81, "lng": 144.96},
+    {"lat": 37.57, "lng": 126.98}, {"lat": 14.60, "lng": 120.98},
+    {"lat": -4.33, "lng": 15.31}, {"lat": 25.20, "lng": 55.27},
+    {"lat": 40.42, "lng": -3.70}, {"lat": 52.52, "lng": 13.41},
+    {"lat": 59.33, "lng": 18.07}, {"lat": 33.89, "lng": 35.50},
+    {"lat": -26.20, "lng": 28.05}, {"lat": 53.55, "lng": -113.49},
+    {"lat": 43.65, "lng": -79.38}, {"lat": -12.05, "lng": -77.04},
+    {"lat": 39.90, "lng": 116.41}, {"lat": -31.95, "lng": 115.86},
+    {"lat": 47.38, "lng": 8.54}, {"lat": 60.17, "lng": 24.94},
+    {"lat": 38.72, "lng": -9.14}, {"lat": 50.85, "lng": 4.35},
+    {"lat": 52.37, "lng": 4.89}, {"lat": 45.44, "lng": 9.19},
+    {"lat": 17.39, "lng": 78.49}, {"lat": 29.56, "lng": 106.55},
+    {"lat": 44.80, "lng": 20.47}, {"lat": -23.55, "lng": -46.63},
+    {"lat": 28.61, "lng": 77.23}, {"lat": 13.75, "lng": 100.50},
 ]
 
 
 def grid_key(lat: float, lng: float) -> tuple:
-    """Return grid cell (row, col) for 1-degree dedup."""
-    return (
-        int(math.floor(lat / GRID_DEG)),
-        int(math.floor(lng / GRID_DEG)),
-    )
+    return (int(math.floor(lat / GRID_DEG)), int(math.floor(lng / GRID_DEG)))
 
 
-def fetch_blitzortung(auth: str) -> list[dict] | None:
+def fetch_via_mqtt(broker: str, port: int, collect_secs: int) -> list[dict]:
     """
-    Fetch recent strikes from Blitzortung protected API.
-
-    Returns list of {"lat": float, "lng": float} dicts, or None on failure.
+    Connect to MQTT broker, subscribe to global geo/# topics,
+    collect strikes for collect_secs, return deduped list.
     """
     try:
-        # Use URL with embedded credentials for HTTP Basic Auth
-        url = BLITZORTUNG_URL
-        if auth and "://" not in auth:
-            # auth is just "user:pass"
-            url = url.replace(
-                "https://data.blitzortung.org/",
-                f"https://{auth}@data.blitzortung.org/",
-            )
+        import paho.mqtt.client as mqtt
+    except ImportError:
+        logger.error("paho-mqtt not installed. Run: pip install paho-mqtt")
+        return None
 
-        req = Request(url)
-        req.add_header("User-Agent", "polar-plus/1.0 (Android live wallpaper)")
+    strikes = []
+    seen = set()
 
-        logger.info(f"Fetching: {BLITZORTUNG_URL}")
-        t0 = time.time()
-        with urlopen(req, timeout=30) as resp:
-            body = resp.read().decode("utf-8", errors="replace")
-        logger.info(f"Downloaded {len(body):,} bytes in {time.time() - t0:.0f}s")
-
-        cutoff = datetime.now(timezone.utc) - timedelta(hours=LOOKBACK_HOURS)
-        cutoff_ns = int(cutoff.timestamp() * 1e9)
-
-        strikes = []
-        seen_grids = set()
-        for line in body.strip().split("\n"):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-                ts = obj.get("time", 0)
-                lat = float(obj.get("lat", 0))
-                lng = float(obj.get("lon", 0))
-
-                # Skip old strikes
-                if ts < cutoff_ns:
-                    continue
-
-                # Grid dedup
-                gk = grid_key(lat, lng)
-                if gk in seen_grids:
-                    continue
-                seen_grids.add(gk)
-
+    def on_message(client, userdata, msg):
+        try:
+            data = json.loads(msg.payload.decode("utf-8", errors="replace"))
+            lat = float(data.get("lat", 0))
+            lng = float(data.get("lon", 0))
+            gk = grid_key(lat, lng)
+            if gk not in seen:
+                seen.add(gk)
                 strikes.append({"lat": lat, "lng": lng})
-            except (ValueError, TypeError, json.JSONDecodeError):
-                continue
+        except (ValueError, TypeError, json.JSONDecodeError):
+            pass  # Skip malformed messages
 
-        logger.info(
-            f"Parsed {len(strikes)} unique strikes in last {LOOKBACK_HOURS}h "
-            f"(cutoff: {cutoff.isoformat()})"
-        )
-        return strikes if strikes else None
+    client = mqtt.Client()
+    client.on_message = on_message
+    client.connect_async(broker, port, 10)
 
-    except HTTPError as e:
-        logger.error(f"HTTP {e.code}: {e.reason}")
-        return None
-    except URLError as e:
-        logger.error(f"Connection failed: {e.reason}")
-        return None
-    except Exception as e:
-        logger.exception("Unexpected error fetching strikes")
-        return None
+    logger.info(f"Connected to MQTT broker {broker}:{port}, subscribing geo/+/# ...")
+    client.subscribe("geo/+/#", qos=0)
+    client.loop_start()
+
+    deadline = time.time() + collect_secs
+    while time.time() < deadline:
+        time.sleep(0.5)
+        if len(strikes) % 100 == 0 and len(strikes) > 0:
+            logger.info(f"  Collected {len(strikes)} strikes so far...")
+
+    client.loop_stop()
+    client.disconnect()
+    logger.info(f"MQTT collection done: {len(strikes)} unique strikes in {collect_secs}s")
+    return strikes
 
 
 def save_storms(strikes: list[dict], output_dir: Path):
@@ -160,10 +115,14 @@ def save_storms(strikes: list[dict], output_dir: Path):
     latest_dir = output_dir / "latest"
     latest_dir.mkdir(parents=True, exist_ok=True)
 
+    if len(strikes) > MAX_STRIKES:
+        import random
+        strikes = random.sample(strikes, MAX_STRIKES)
+
     path = latest_dir / "storms.json"
     with open(path, "w") as f:
         json.dump(strikes, f, separators=(",", ":"))
-    logger.info(f"Saved {len(strikes)} storms → {path} ({path.stat().st_size:,} bytes)")
+    logger.info(f"Saved {len(strikes)} storms -> {path} ({path.stat().st_size:,} bytes)")
 
 
 def main():
@@ -171,29 +130,12 @@ def main():
         Path(__file__).resolve().parent / "output"
     )))
 
-    auth = os.environ.get("BLITZORTUNG_AUTH", "").strip()
+    logger.info(f"Fetching lightning strikes via MQTT ({MQTT_BROKER}:{MQTT_PORT})...")
+    strikes = fetch_via_mqtt(MQTT_BROKER, MQTT_PORT, COLLECT_SECONDS)
 
-    strikes = None
-    if auth:
-        logger.info("BLITZORTUNG_AUTH set, attempting live fetch...")
-        strikes = fetch_blitzortung(auth)
-    else:
-        logger.warning(
-            "BLITZORTUNG_AUTH not set — "
-            "using default placeholder locations. "
-            "Set the secret in GitHub Actions for live lightning data."
-        )
-
-    if strikes is None:
+    if strikes is None or len(strikes) == 0:
+        logger.warning("MQTT fetch returned no data, using default locations")
         strikes = DEFAULT_LOCATIONS
-        logger.info(f"Using {len(strikes)} default locations as placeholder.")
-
-    # Limit to reasonable count for mobile app memory
-    if len(strikes) > 2000:
-        # Random sample to cap
-        import random
-        strikes = random.sample(strikes, 2000)
-        logger.info(f"Capped to 2000 strikes.")
 
     save_storms(strikes, output_dir)
 
