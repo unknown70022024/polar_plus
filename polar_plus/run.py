@@ -20,7 +20,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from polar_plus.config import OUTPUT_DIR, FACE_SIZE, LON_OFFSET, TARGET_W, TARGET_H, FACE_NAME_MAP
+from polar_plus.config import OUTPUT_DIR, FACE_SIZE, LON_OFFSET, TARGET_W, TARGET_H
 from polar_plus.cubemap import equirect_to_cubemap
 from polar_plus.gmgsi_load import load_core_density, post_process_density
 from polar_plus.capfill import fill_polar_caps
@@ -35,12 +35,10 @@ logger = logging.getLogger("run")
 def save_faces(faces: dict, tiles_dir: Path):
     tiles_dir.mkdir(parents=True, exist_ok=True)
     for face_name, face_img in faces.items():
-        # Apply face name remapping for original app compatibility
-        save_name = FACE_NAME_MAP.get(face_name, face_name)
-        path = tiles_dir / f"{save_name}.jpg"
+        path = tiles_dir / f"{face_name}.jpg"
         face_img.convert('RGB').save(path, quality=95, optimize=True, subsampling=0)
         size_kb = path.stat().st_size / 1024
-        print(f"  [SAVE] {face_name} → {path.name} ({size_kb:.0f} KB)")
+        print(f"  [SAVE] {path.name} ({size_kb:.0f} KB)")
 
 
 def run_pipeline(api_key: str = ""):
@@ -114,9 +112,8 @@ def run_pipeline(api_key: str = ""):
     latest_tiles = latest_dir / "tiles"
     latest_tiles.mkdir(parents=True, exist_ok=True)
     for face_name, face_img in faces.items():
-        save_name = FACE_NAME_MAP.get(face_name, face_name)
-        src = tiles_dir / f"{save_name}.jpg"
-        dst = latest_tiles / f"{save_name}.jpg"
+        src = tiles_dir / f"{face_name}.jpg"
+        dst = latest_tiles / f"{face_name}.jpg"
         shutil.copy2(src, dst)
     # Save root.json to latest/
     latest_root = latest_dir / "root.json"

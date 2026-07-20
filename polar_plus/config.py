@@ -10,20 +10,6 @@ FACE_SIZE = 1024
 LON_OFFSET = 0.0
 FACES = ['px', 'nx', 'py', 'ny', 'pz', 'nz']
 
-# Face name remapping for original app compatibility.
-# The original app uses cloudTransformMatrix = R_x(-90)*R_z(-90) which
-# permutes the sampling directions. Our standard OpenGL cubemap faces must
-# be renamed so each file contains the geographic region the app expects.
-# Mapping: our_face → original_app_expected_name
-FACE_NAME_MAP = {
-    'px': 'pz',   # our px (90E/Asia)      → app expects at pz slot
-    'nx': 'nz',   # our nx (90W/Americas)   → app expects at nz slot
-    'py': 'px',   # our py (North Pole)     → app expects at px slot
-    'ny': 'nx',   # our ny (South Pole)     → app expects at nx slot
-    'pz': 'py',   # our pz (0° meridian)    → app expects at py slot
-    'nz': 'ny',   # our nz (180° dateline)  → app expects at ny slot
-}
-
 # GMGSI S3
 GMGSI_BUCKET = "noaa-gmgsi-pds"
 GMGSI_REGION = "us-east-1"
