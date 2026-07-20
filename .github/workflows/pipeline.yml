@@ -53,4 +53,5 @@ jobs:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_dir: output/latest
           keep_files: false
+          force_orphan: true
           enable_jekyll: false
