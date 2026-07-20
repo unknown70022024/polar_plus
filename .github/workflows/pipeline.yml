@@ -6,11 +6,8 @@ on:
     - cron: '7 */3 * * *'
   workflow_dispatch:  # Manual trigger for testing
 
-# Required for GitHub Pages deployment
 permissions:
-  contents: write
-  pages: write
-  id-token: write
+  contents: read
 
 jobs:
   pipeline:
@@ -34,24 +31,28 @@ jobs:
         run: python -m polar_plus.run
         env:
           OUTPUT_DIR: ${{ github.workspace }}/output
-          # GitHub Pages URL — built automatically from repo info.
-          # Override with GH_PAGES_BASE if using a custom domain.
           GH_PAGES_BASE: ${{ vars.GH_PAGES_BASE }}
 
       - name: Fetch Blitzortung storm data
         run: python polar_plus/fetch_storms.py
         env:
           OUTPUT_DIR: ${{ github.workspace }}/output
-          # Set BLITZORTUNG_AUTH as repository secret for live lightning data.
-          # Format: username:password
-          # Leave unset to use default placeholder locations.
-          BLITZORTUNG_AUTH: ${{ secrets.BLITZORTUNG_AUTH }}
 
-      - name: Deploy to GitHub Pages
-        uses: peaceiris/actions-gh-pages@v4
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: output/latest
-          keep_files: false
-          force_orphan: true
-          enable_jekyll: false
+          path: output/latest
+
+  deploy:
+    needs: pipeline
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
