@@ -101,25 +101,29 @@ def bt_to_density(vals: np.ndarray, is_pre_scaled: bool) -> np.ndarray:
 
 
 def post_process_density(density: np.ndarray,
-                         threshold: int = 20,
-                         gamma: float = 0.75) -> np.ndarray:
+                         threshold: int = 35) -> np.ndarray:
     """
-    Remove low-density noise and boost cloud contrast.
+    Remove low-density noise and apply linear contrast stretch.
 
     threshold: pixel values below this become 0 (clear sky).
-               Atmospheric background noise typically registers as 0-30/255.
-    gamma:     < 1.0 suppresses thin haze while preserving thick cloud brightness.
+    Linear stretch: [threshold, max] → [0, 255] preserves cloud feature
+    geometry without the centroid shift that gamma correction causes.
     """
     # 1. Threshold — kill atmospheric noise in clear areas
     density = np.where(density < threshold, 0, density)
 
-    # 2. Gamma correction — darken low-density haze, keep dense clouds bright
-    normalized = density.astype(np.float32) / 255.0
-    corrected = np.power(normalized, gamma) * 255.0
-    density = np.clip(corrected, 0, 255).astype(np.uint8)
+    # 2. Linear contrast stretch — preserves relative brightness ordering
+    valid = density[density > 0]
+    if len(valid) > 1:
+        vmin, vmax = valid.min(), valid.max()
+        if vmax > vmin:
+            density = np.clip(
+                (density.astype(np.float32) - vmin) / (vmax - vmin) * 255.0,
+                0, 255
+            ).astype(np.uint8)
 
     logger.info(
-        f"Post-process: threshold={threshold}, gamma={gamma}, "
+        f"Post-process: threshold={threshold}, linear stretch, "
         f"zeros={np.sum(density == 0) / density.size * 100:.1f}%"
     )
     return density
