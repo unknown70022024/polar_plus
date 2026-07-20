@@ -1,5 +1,5 @@
 """
-polar_plus/config.py — 独立配置
+polar_plus/config.py — GCC pipeline configuration.
 """
 import os
 from pathlib import Path
@@ -10,27 +10,35 @@ FACE_SIZE = 1024
 LON_OFFSET = 0.0
 FACES = ['px', 'nx', 'py', 'ny', 'pz', 'nz']
 
-# GMGSI S3
-GMGSI_BUCKET = "noaa-gmgsi-pds"
-GMGSI_REGION = "us-east-1"
-BT_WARM = 280.0
-BT_COLD = 200.0
-BT_FILL = -999.0
+# ---------------------------------------------------------------------------
+# NASA GCC v2a (Global Cloud Composite) — primary data source
+# ---------------------------------------------------------------------------
+GCC_V2A_BASE = ("https://satcorps.larc.nasa.gov/prod/GCC-GEO-LEO/v2a/"
+                "visst-pixel-netcdf")
 
-# SSEC RealEarth WMS (mapserv CGI, 支持 BBOX 分块)
+BT_WARM = 285.0       # Kelvin — above this → clear sky (density=0)
+BT_COLD = 200.0       # Kelvin — below this → thick cloud (density=255)
+SEARCH_HOURS = 96     # Look-back window for latest GCC file
+
+# ---------------------------------------------------------------------------
+# SSEC RealEarth — polar gap-fill backup
+# ---------------------------------------------------------------------------
 SSEC_WMS_URL = ("https://realearth.ssec.wisc.edu/cgi-bin/mapserv"
                 "?map=globalir.map&SERVICE=WMS&VERSION=1.1.1"
                 "&REQUEST=GetMap&LAYERS=globalir&FORMAT=image/png"
                 "&SRS=EPSG:4326")
 
-# 分块参数（免费 WMS 最大边长 512px）
-TILE_W = 512         # 每块宽度
-TILE_H = 512         # 每块高度
-LON_TILES = 10       # 经度方向分块数（360° / 10 = 36° 每块）
+SSEC_API_BASE = "http://re.ssec.wisc.edu/api/image"
 
-# Core latitude range
-CORE_LAT_NORTH = 60.0
-CORE_LAT_SOUTH = -60.0
+GAP_LAT_THRESHOLD = 60.0    # |lat| > threshold → allow SSEC gap-fill
+FEATHER_WIDTH = 2.0         # degrees — cosine feather at gap edges
+MERCATOR_LAT_HIGH = 85.0    # Mercator reprojection upper bound
+BBOX_LAT_TOP = 89.9         # bbox patch top (near-pole)
+
+# Mercator tile params
+TILE_Z = 2
+TILE_SIZE = 256
+N_TILES = 2 ** TILE_Z       # 4
 
 # Target equirectangular size
 TARGET_W = 5000

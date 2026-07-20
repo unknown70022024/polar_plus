@@ -1,29 +1,55 @@
 #!/usr/bin/env python3
 """
-polar_plus/run.py — GMGSI + SSEC WMS 极区拼接管线
+polar_plus/run.py — NASA GCC v2a + SSEC polar gap-fill pipeline
 
-流程：
-  1. 从 AWS S3 下载最新 GMGSI (60N-60S 核心)
-  2. BT -> 云密度
-  3. 从 SSEC RealEarth WMS 下载南北极区渲染图
-  4. 直方图匹配 + 羽化拼接 -> 全球密度图
-  5. Cubemap 投影 -> 6 面 JPG
+Flow:
+  1. Find latest GCC v2a file (96h search, 30-min slots)
+  2. Remote-read BT_10.8um + cloud_phase via h5netcdf
+  3. BT → cloud density + gamma correction
+  4. Downsample to target equirectangular
+  5. SSEC gap-fill: only fill pixels where GCC density==0 in polar regions
+  6. Post-process (threshold + linear stretch)
+  7. Cubemap projection → 6-face JPG
+  8. Deploy to GitHub Pages (via GitHub Actions)
 """
 import json
 import logging
 import os
 import shutil
-import sys
 import time
 from pathlib import Path
 
 import numpy as np
 from PIL import Image
 
-from polar_plus.config import OUTPUT_DIR, FACE_SIZE, LON_OFFSET, TARGET_W, TARGET_H
+from polar_plus.config import (OUTPUT_DIR, FACE_SIZE, LON_OFFSET,
+                                TARGET_W, TARGET_H)
 from polar_plus.cubemap import equirect_to_cubemap
-from polar_plus.gmgsi_load import load_core_density, post_process_density
-from polar_plus.capfill import fill_polar_caps
+from polar_plus.gcc_load import load_gcc_density
+from polar_plus.capfill import fill_gcc_gaps
+
+
+def _post_process(density: np.ndarray, threshold: int = 45) -> np.ndarray:
+    """Remove low-density noise and apply linear contrast stretch.
+
+    threshold: pixel values below this become 0 (clear sky).
+    Linear stretch: [threshold, max] → [0, 255] preserves cloud feature
+    geometry without the centroid shift that gamma correction causes.
+    """
+    density = np.where(density < threshold, 0, density)
+    valid = density[density > 0]
+    if len(valid) > 1:
+        vmin, vmax = valid.min(), valid.max()
+        if vmax > vmin:
+            density = np.clip(
+                (density.astype(np.float32) - vmin) / (vmax - vmin) * 255.0,
+                0, 255
+            ).astype(np.uint8)
+    logger.info(
+        f"Post-process: threshold={threshold}, linear stretch, "
+        f"zeros={np.sum(density == 0) / density.size * 100:.1f}%"
+    )
+    return density
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,58 +68,61 @@ def save_faces(faces: dict, tiles_dir: Path):
 
 
 def run_pipeline(api_key: str = ""):
-    """完整管线"""
-    print("=== GMGSI + SSEC WMS Polar Fill Pipeline ===\n")
+    """GCC v2a + SSEC gap-fill pipeline."""
+    print("=== NASA GCC v2a + SSEC Polar Gap-Fill Pipeline ===\n")
 
-    # Step 1: GMGSI 核心
-    print("[1/4] Loading GMGSI core (60N-60S)...")
     t0 = time.time()
-    core_density, lat_grid, lon_grid, ts = load_core_density(
-        target_w=TARGET_W, max_days_back=14)
-    print(f"  Core: {core_density.shape}, zeros={np.sum(core_density==0)/core_density.size*100:.1f}%")
+
+    # Step 1: GCC global data
+    print("[1/5] Loading GCC v2a global cloud composite...")
+    density, lat_grid, lon_grid, ts = load_gcc_density(
+        target_w=TARGET_W, target_h=TARGET_H)
+    print(f"  Density: {density.shape}, "
+          f"zeros={np.sum(density==0)/density.size*100:.1f}%")
     print(f"  Lat: {lat_grid[0]:.1f} to {lat_grid[-1]:.1f}")
     print(f"  Time: {time.time()-t0:.0f}s")
 
-    # Step 2: 极区填充
-    print(f"\n[2/4] Filling polar caps via SSEC WMS...")
+    # Save GCC source before gap-fill
+    raw_path = OUTPUT_DIR / f"gcc_source_{ts}.png"
+    Image.fromarray(density, mode='L').save(raw_path)
+    print(f"\n  Saved GCC source: {raw_path}")
+
+    # Step 2: SSEC polar gap-fill
+    print(f"\n[2/5] SSEC polar gap-fill (matching timestamp {ts})...")
     t1 = time.time()
-    full_density = fill_polar_caps(core_density, lat_grid, lon_grid, api_key)
-    print(f"  Full: {full_density.shape}")
+    density = fill_gcc_gaps(density, lat_grid, lon_grid, ts, api_key)
     print(f"  Time: {time.time()-t1:.0f}s")
 
-    # 保存调试图
-    raw_path = OUTPUT_DIR / f"polar_plus_source_{ts}.png"
-    Image.fromarray(full_density, mode='L').save(raw_path)
-    print(f"\n  Saved source: {raw_path}")
+    # Save post-gap-fill debug image
+    gapfill_path = OUTPUT_DIR / f"gapfill_{ts}.png"
+    Image.fromarray(density, mode='L').save(gapfill_path)
+    print(f"  Saved gap-filled: {gapfill_path}")
+
+    # Step 3: Post-process
+    print(f"\n[3/5] Post-processing density (threshold + linear stretch)...")
+    density = _post_process(density, threshold=45)
 
     print(f"\n  Density stats: "
-          f"min={full_density.min()}, max={full_density.max()}, "
-          f"mean={full_density.mean():.1f}, "
-          f"zeros={np.sum(full_density==0)/full_density.size*100:.1f}%")
+          f"min={density.min()}, max={density.max()}, "
+          f"mean={density.mean():.1f}, "
+          f"zeros={np.sum(density==0)/density.size*100:.1f}%")
 
-    # Step 2.5: 密度后处理（阈值去噪 + Gamma 校正）
-    print(f"\n[2.5/4] Post-processing density (threshold + gamma)...")
-    full_density = post_process_density(full_density, threshold=45)
-
-    # Step 3: Cubemap
-    print(f"\n[3/4] Equirect to cubemap...")
+    # Step 4: Cubemap projection
+    print(f"\n[4/5] Equirectangular to cubemap...")
     ts_dir = OUTPUT_DIR / ts
     tiles_dir = ts_dir / "tiles"
-    h, w = full_density.shape[:2]
-    faces = equirect_to_cubemap(full_density, w, h,
-                                 FACE_SIZE, LON_OFFSET)
+    h, w = density.shape[:2]
+    faces = equirect_to_cubemap(density, w, h, FACE_SIZE, LON_OFFSET)
 
-    # Step 4: 保存
-    print(f"\n[4/4] Saving faces...")
+    # Step 5: Save
+    print(f"\n[5/5] Saving faces...")
     save_faces(faces, tiles_dir)
 
-    # Use GH_PAGES_BASE env var if set (recommended), otherwise fall back
-    # GitHub Pages URL format: https://<username>.github.io/<repo>/
+    # Build root.json with GitHub Pages URL
     gh_pages_base = os.environ.get("GH_PAGES_BASE", "")
     if gh_pages_base:
         base_url = f"{gh_pages_base.rstrip('/')}/tiles/"
     else:
-        # Fallback: construct from GITHUB_REPOSITORY
         repo = os.environ.get("GITHUB_REPOSITORY", "owner/polar_plus")
         owner = repo.split("/")[0].lower()
         repo_name = repo.split("/")[1] if "/" in repo else "polar_plus"
@@ -101,21 +130,20 @@ def run_pipeline(api_key: str = ""):
 
     root_data = {"baseUrl": base_url, "timestamp": ts}
 
-    # Save root.json to timestamped directory
+    # root.json → timestamped dir
     root_path = ts_dir / "root.json"
     with open(root_path, 'w') as f:
         json.dump(root_data, f)
     print(f"  [SAVE] root.json -> {root_path}")
 
-    # Also stage to latest/ directory for stable app URL
+    # Stage to latest/ for stable app URL
     latest_dir = OUTPUT_DIR / "latest"
     latest_tiles = latest_dir / "tiles"
     latest_tiles.mkdir(parents=True, exist_ok=True)
-    for face_name, face_img in faces.items():
+    for face_name in faces:
         src = tiles_dir / f"{face_name}.jpg"
         dst = latest_tiles / f"{face_name}.jpg"
         shutil.copy2(src, dst)
-    # Save root.json to latest/
     latest_root = latest_dir / "root.json"
     with open(latest_root, 'w') as f:
         json.dump(root_data, f)
@@ -128,8 +156,7 @@ def run_pipeline(api_key: str = ""):
 
 def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    # API key 可选，从环境变量读取
-    api_key = ""
+    api_key = os.environ.get("SSEC_API_KEY", "")
     run_pipeline(api_key)
     print(f"\n[DONE] Files in {OUTPUT_DIR.resolve()}")
 
