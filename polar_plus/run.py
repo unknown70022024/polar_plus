@@ -58,6 +58,27 @@ logging.basicConfig(
 logger = logging.getLogger("run")
 
 
+def fix_edges_copy(density: np.ndarray, n: int = 3) -> np.ndarray:
+    """Replace edge columns with copies of interior columns.
+
+    PIL LANCZOS downsampling truncates the kernel at image edges,
+    producing anomalous values in the first few columns. The left and
+    right edges represent the same longitude (180°) and should match,
+    but LANCZOS computes them independently → mismatch at the dateline.
+
+    The nx cubemap face centre row maps entirely to col 0, so any
+    anomaly there becomes a visible north-south seam on the globe.
+
+    Fix: overwrite the first/last N columns with copies from N columns
+    deeper into the interior, bypassing the LANCZOS edge artifact.
+    """
+    for i in range(n):
+        density[:, i] = density[:, n + i]           # col 0 = col n
+        density[:, -(i + 1)] = density[:, -(n + i + 1)]  # col -1 = col -(n+1)
+    logger.info(f"Edge fix: replaced {n} edge cols with interior copies")
+    return density
+
+
 def save_faces(faces: dict, tiles_dir: Path):
     tiles_dir.mkdir(parents=True, exist_ok=True)
     for face_name, face_img in faces.items():
@@ -106,6 +127,9 @@ def run_pipeline(api_key: str = ""):
           f"min={density.min()}, max={density.max()}, "
           f"mean={density.mean():.1f}, "
           f"zeros={np.sum(density==0)/density.size*100:.1f}%")
+
+    # Step 3.5: Fix dateline edge artifact
+    density = fix_edges_copy(density)
 
     # Step 4: Cubemap projection
     print(f"\n[4/5] Equirectangular to cubemap...")

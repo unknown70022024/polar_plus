@@ -2,8 +2,8 @@ name: Polar Plus Pipeline
 
 on:
   schedule:
-    # Every 3 hours, at 7 minutes past the hour (offset to avoid peak)
-    - cron: '7 */3 * * *'
+    # Every 2 hours, at 13 minutes past (offset to avoid peak :00/:30 contention)
+    - cron: '13 */2 * * *'
   workflow_dispatch:  # Manual trigger for testing
 
 permissions:
@@ -12,7 +12,7 @@ permissions:
 jobs:
   pipeline:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 15
 
     steps:
       - uses: actions/checkout@v4
@@ -21,11 +21,10 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
 
       - name: Install dependencies
-        run: |
-          pip install --upgrade pip
-          pip install numpy pillow xarray netCDF4 h5netcdf h5py fsspec requests aiohttp
+        run: pip install -r requirements.txt
 
       - name: Run polar_plus cloud pipeline
         run: python -m polar_plus.run

@@ -11,7 +11,7 @@ Data:
   - Grid: 12960×6480 regular equirectangular (~3 km at equator), 90N to -90S
   - Variables: BT_10.8um (10.8μm brightness temp, uint16+scale_factor 0.01)
                cloud_phase (uint8, 0=clear, 1=liquid, 2=ice, 3+=other)
-  - Latency: ~2 days (v2a edition updates continuously)
+  - Latency: ~2h (GCC hourly updates, ~2h behind real-time)
   - Format: NetCDF4/HDF5 with chunked zlib compression
 """
 import logging
@@ -37,25 +37,36 @@ def _gcc_url(dt: datetime) -> str:
 
 
 def find_latest_gcc(max_hours_back: int = SEARCH_HOURS) -> tuple:
-    """Scan recent 30-min slots for latest available GCC v2a file.
+    """Scan recent hours for latest available GCC v2a file.
+
+    GCC v2a data is published hourly (HH:00) with ~2h latency.
 
     Returns:
         (datetime, url) or (None, None) if nothing found.
     """
     now = datetime.now(timezone.utc)
+    skipped = 0
     for hours_ago in range(max_hours_back + 1):
-        for minute in [0, 30]:
-            dt = now - timedelta(hours=hours_ago, minutes=minute)
-            dt = dt.replace(second=0, microsecond=0)
-            url = _gcc_url(dt)
-            try:
-                import urllib.request
-                req = urllib.request.Request(url, method='HEAD')
-                with urllib.request.urlopen(req, timeout=10) as resp:
-                    if resp.status == 200:
-                        return dt, url
-            except Exception:
-                continue
+        dt = now - timedelta(hours=hours_ago)
+        dt = dt.replace(minute=0, second=0, microsecond=0)
+        url = _gcc_url(dt)
+        try:
+            import urllib.request
+            req = urllib.request.Request(url, method='HEAD')
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                if resp.status == 200:
+                    logger.info(
+                        f"Found GCC: {dt.strftime('%Y-%m-%d %H:%M')}Z "
+                        f"(skipped {skipped} newer unavailable slots, "
+                        f"searched back {hours_ago}h)"
+                    )
+                    return dt, url
+                else:
+                    skipped += 1
+        except Exception:
+            skipped += 1
+            continue
+    logger.warning(f"No GCC data found in past {max_hours_back}h ({skipped} slots checked)")
     return None, None
 
 
