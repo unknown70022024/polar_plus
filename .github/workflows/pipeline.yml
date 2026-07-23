@@ -2,8 +2,8 @@ name: Polar Plus Pipeline
 
 on:
   schedule:
-    # Every 2 hours, at 13 minutes past (offset to avoid peak :00/:30 contention)
-    - cron: '13 */2 * * *'
+    # Every 2 hours at :13 past (explicit hours — avoids GitHub cron parser issues with */2)
+    - cron: '13 0,2,4,6,8,10,12,14,16,18,20,22 * * *'
   workflow_dispatch:  # Manual trigger for testing
 
 permissions:
