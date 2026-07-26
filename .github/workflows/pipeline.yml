@@ -27,7 +27,9 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Run polar_plus cloud pipeline
-        run: python -m polar_plus.run
+        run: |
+          python -m polar_plus.run
+          echo "GCC_TIMESTAMP=$(python -c "import json; print(json.load(open('output/latest/root.json'))['timestamp'])")" >> $GITHUB_ENV
         env:
           OUTPUT_DIR: ${{ github.workspace }}/output
           GH_PAGES_BASE: ${{ vars.GH_PAGES_BASE }}

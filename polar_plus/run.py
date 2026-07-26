@@ -108,6 +108,9 @@ def run_pipeline(api_key: str = ""):
     Image.fromarray(density, mode='L').save(raw_path)
     print(f"\n  Saved GCC source: {raw_path}")
 
+    # Emit GCC timestamp for downstream fetch_storms.py (GitHub Actions GITHUB_ENV)
+    print(f"GCC_TS={ts}")
+
     # Step 2: SSEC polar gap-fill
     print(f"\n[2/5] SSEC polar gap-fill (matching timestamp {ts})...")
     t1 = time.time()
@@ -133,6 +136,7 @@ def run_pipeline(api_key: str = ""):
 
     # Step 4: Cubemap projection
     print(f"\n[4/5] Equirectangular to cubemap...")
+    density = fix_edges_copy(density)
     ts_dir = OUTPUT_DIR / ts
     tiles_dir = ts_dir / "tiles"
     h, w = density.shape[:2]
