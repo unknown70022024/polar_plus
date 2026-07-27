@@ -126,7 +126,7 @@ def fetch_bo_service(minute_offset: int = 0) -> list[dict] | None:
     if total_count == 0:
         return None
 
-    weights = [max(cell[2], 1) for cell in grid_cells]
+    weights = [math.sqrt(max(cell[2], 1)) for cell in grid_cells]
     sample_size = min(MAX_STRIKES, len(grid_cells))
     sampled = random.choices(grid_cells, weights=weights, k=sample_size)
 
