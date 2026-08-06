@@ -39,6 +39,11 @@ jobs:
         env:
           OUTPUT_DIR: ${{ github.workspace }}/output
 
+      - name: Fetch NOAA aurora oval data
+        run: python polar_plus/fetch_aurora.py
+        env:
+          OUTPUT_DIR: ${{ github.workspace }}/output
+
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
