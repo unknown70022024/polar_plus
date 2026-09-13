@@ -2,8 +2,10 @@ name: Polar Plus Pipeline
 
 on:
   schedule:
-    # Every 2 hours at :13 past (explicit hours — avoids GitHub cron parser issues with */2)
-    - cron: '13 0,2,4,6,8,10,12,14,16,18,20,22 * * *'
+    # Every 2 hours at :48 past (explicit hours — avoids GitHub cron parser issues with */2).
+    # :48 leaves 48 min of margin after the selected GCC file finalises on the
+    # hour (the file for HH:00Z stops growing at HH+2:00Z); the old :13 left only 13 min.
+    - cron: '48 0,2,4,6,8,10,12,14,16,18,20,22 * * *'
   workflow_dispatch:  # Manual trigger for testing
 
 permissions:

@@ -19,6 +19,7 @@ GCC_V2A_BASE = ("https://satcorps.larc.nasa.gov/prod/GCC-GEO-LEO/v2a/"
 BT_WARM = 285.0       # Kelvin — above this → clear sky (density=0)
 BT_COLD = 200.0       # Kelvin — below this → thick cloud (density=255)
 SEARCH_HOURS = 96     # Look-back window for latest GCC file
+MIN_AGE_HOURS = 2     # Skip files younger than this (still being assembled)
 
 # ---------------------------------------------------------------------------
 # SSEC RealEarth — polar gap-fill backup

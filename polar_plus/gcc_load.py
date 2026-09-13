@@ -15,11 +15,13 @@ Data:
   - Format: NetCDF4/HDF5 with chunked zlib compression
 """
 import logging
+import time
 from datetime import datetime, timezone, timedelta
 
 import numpy as np
 
-from polar_plus.config import GCC_V2A_BASE, BT_WARM, BT_COLD, SEARCH_HOURS
+from polar_plus.config import (GCC_V2A_BASE, BT_WARM, BT_COLD, SEARCH_HOURS,
+                               MIN_AGE_HOURS)
 
 logger = logging.getLogger(__name__)
 
@@ -36,17 +38,22 @@ def _gcc_url(dt: datetime) -> str:
             f"{yyyy}{doy}.{hhmm}.3km.nc")
 
 
-def find_latest_gcc(max_hours_back: int = SEARCH_HOURS) -> tuple:
-    """Scan recent hours for latest available GCC v2a file.
+def find_latest_gcc(max_hours_back: int = SEARCH_HOURS,
+                    min_age_hours: int = MIN_AGE_HOURS) -> tuple:
+    """Scan recent hours for the latest FINALISED GCC v2a file.
 
-    GCC v2a data is published hourly (HH:00) with ~2h latency.
+    GCC v2a files are published hourly (HH:00) but keep growing for ~2h
+    as late-arriving LEO granules are appended (the file for hour H is
+    finalised around H+2h). Reading a younger, still-assembling file
+    returns corrupt chunks and large rectangular holes, so we skip any
+    file younger than min_age_hours.
 
     Returns:
         (datetime, url) or (None, None) if nothing found.
     """
     now = datetime.now(timezone.utc)
     skipped = 0
-    for hours_ago in range(max_hours_back + 1):
+    for hours_ago in range(min_age_hours, max_hours_back + 1):
         dt = now - timedelta(hours=hours_ago)
         dt = dt.replace(minute=0, second=0, microsecond=0)
         url = _gcc_url(dt)
@@ -57,7 +64,7 @@ def find_latest_gcc(max_hours_back: int = SEARCH_HOURS) -> tuple:
                 if resp.status == 200:
                     logger.info(
                         f"Found GCC: {dt.strftime('%Y-%m-%d %H:%M')}Z "
-                        f"(skipped {skipped} newer unavailable slots, "
+                        f"(skipped {skipped} newer assembling slots, "
                         f"searched back {hours_ago}h)"
                     )
                     return dt, url
@@ -70,37 +77,119 @@ def find_latest_gcc(max_hours_back: int = SEARCH_HOURS) -> tuple:
     return None, None
 
 
-def read_gcc_bt(url: str) -> tuple:
-    """Remote-read BT_10.8um + cloud_phase from GCC v2a NetCDF via h5netcdf.
+def _head_gcc(url: str) -> tuple:
+    """HEAD the GCC file and return a stability signature.
 
-    Only downloads compressed chunks (~96 MB total network transfer).
-
-    Returns:
-        bt_k: (6480, 12960) float32 Kelvin
-        cloud_phase: (6480, 12960) float32, 0=clear, 1=liquid, 2=ice, ...
-        lat: (6480,) float64, 89.99 ~ -89.99
-        lon: (12960,) float64, -179.99 ~ 179.99
+    Returns (Content-Length, Last-Modified, ETag), or None if the HEAD
+    request fails.
     """
-    import xarray as xr
-    from time import time
+    import urllib.request
 
-    logger.info(f"Opening GCC: {url}")
-    ds = xr.open_dataset(url, decode_times=False, engine='h5netcdf')
+    try:
+        req = urllib.request.Request(url, method='HEAD')
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return (
+                resp.headers.get('Content-Length'),
+                resp.headers.get('Last-Modified'),
+                resp.headers.get('ETag'),
+            )
+    except Exception as e:
+        logger.warning(f"GCC HEAD failed: {e}")
+        return None
 
-    t0 = time()
-    bt = ds['BT_10.8um'].values.squeeze()      # (6480, 12960)
-    cp = ds['cloud_phase'].values.squeeze()     # (6480, 12960)
-    lat = ds.coords['lat'].values               # (6480,)
-    lon = ds.coords['lon'].values               # (12960,)
-    elapsed = time() - t0
+
+def _wait_stable(url: str, max_wait: int = 180, interval: int = 8) -> tuple:
+    """Wait until two consecutive HEAD signatures match.
+
+    NASA regenerates the hourly composite in place (late-arriving LEO
+    granules are appended), so the file grows while it is being written.
+    Reading a mid-regeneration file produces corrupt chunks and large
+    rectangular holes. This gate waits until the file stops changing
+    before returning its signature.
+    """
+    prev = _head_gcc(url)
+    deadline = time.time() + max_wait
+    while time.time() < deadline:
+        time.sleep(interval)
+        cur = _head_gcc(url)
+        if cur is not None and cur == prev:
+            return cur
+        if cur is not None and prev is not None:
+            logger.info(
+                f"GCC file changing, waiting for stability... ({prev} -> {cur})"
+            )
+        prev = cur
+    logger.warning(f"GCC file did not stabilise within {max_wait}s")
+    return prev
+
+
+def _read_needed_vars(url: str) -> tuple:
+    """Read only BT_10.8um + cloud_phase + lat/lon via h5py.
+
+    Uses h5py directly instead of xarray's open_dataset, which decodes
+    every variable (including the variable-length string granule_name_list
+    that triggers fragile global-heap reads over HTTP). Only the ~100 MB
+    of compressed chunks for the two cloud fields are transferred.
+    """
+    import fsspec
+    import h5py
+
+    t0 = time.time()
+    fs = fsspec.filesystem("http", block_size=1024 * 1024)  # 1 MB blocks
+    with fs.open(url, "rb") as f:
+        with h5py.File(f, "r") as h:
+            bt_raw = h['BT_10.8um'][0, :, :]    # (6480, 12960) uint16
+            cp_raw = h['cloud_phase'][0, :, :]  # (6480, 12960) uint8
+            lat = h['lat'][:]                   # (6480,)
+            lon = h['lon'][:]                   # (12960,)
+
+    # scale_factor + _FillValue / valid_range -> float Kelvin + NaN
+    bt = bt_raw.astype(np.float32) * 0.01
+    bt[(bt_raw == 65535) | (bt_raw < 18000) | (bt_raw > 40000)] = np.nan
+    cp = cp_raw.astype(np.float32)
+    cp[(cp_raw == 127) | (cp_raw > 13)] = np.nan
 
     logger.info(
-        f"Read BT_10.8um+phase: {bt.shape} in {elapsed:.0f}s, "
+        f"Read BT_10.8um+phase: {bt.shape} in {time.time() - t0:.0f}s, "
         f"BT {np.nanmin(bt):.1f}~{np.nanmax(bt):.1f}K, "
         f"cloud={(cp >= 1).sum() / cp.size * 100:.0f}%"
     )
-    ds.close()
     return bt, cp, lat, lon
+
+
+def read_gcc_bt(url: str, max_retries: int = 3) -> tuple:
+    """Read BT_10.8um + cloud_phase with a stability gate + retry.
+
+    Flow:
+      1. Wait until the file stops changing (stability gate).
+      2. Read only the needed variables (h5py direct).
+      3. HEAD again: if the signature changed, the file was rewritten
+         mid-read -> discard and retry.
+
+    Returns:
+        bt_k: (6480, 12960) float32 Kelvin (NaN where invalid)
+        cloud_phase: (6480, 12960) float32, 0=clear, 1=liquid, 2=ice, ...
+        lat: (6480,) float32
+        lon: (12960,) float32
+    """
+    for attempt in range(max_retries):
+        before = _wait_stable(url)
+        try:
+            bt, cp, lat, lon = _read_needed_vars(url)
+        except Exception as e:
+            logger.warning(f"Read attempt {attempt + 1}/{max_retries} failed: {e}")
+            time.sleep(2 ** attempt)
+            continue
+        after = _head_gcc(url)
+        if after == before:
+            return bt, cp, lat, lon
+        logger.warning(
+            f"GCC file changed during read (attempt {attempt + 1}/{max_retries}), "
+            f"retrying..."
+        )
+    raise RuntimeError(
+        f"GCC file could not be read stably after {max_retries} attempts: {url}"
+    )
 
 
 def _bt_to_density(bt_k: np.ndarray,
