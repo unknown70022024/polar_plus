@@ -58,24 +58,66 @@ logging.basicConfig(
 logger = logging.getLogger("run")
 
 
-def fix_edges_copy(density: np.ndarray, n: int = 3) -> np.ndarray:
-    """Replace edge columns with copies of interior columns.
+def repair_dateline_seam(density: np.ndarray) -> np.ndarray:
+    """Rebuild the dateline columns so the equirectangular wrap is seamless.
 
-    PIL LANCZOS downsampling truncates the kernel at image edges,
-    producing anomalous values in the first few columns. The left and
-    right edges represent the same longitude (180°) and should match,
-    but LANCZOS computes them independently → mismatch at the dateline.
+    Two separate defects meet at lon 180:
 
-    The nx cubemap face centre row maps entirely to col 0, so any
-    anomaly there becomes a visible north-south seam on the globe.
+    1. **The GCC composite's own grid is defective there.** Its outermost
+       4 columns on each side carry ~37% missing values against ~0% in the
+       interior (measured on the raw BT_10.8um: cols 0-3 and 12956-12959),
+       so after downsampling column 0 is ~67% zero and its neighbour ~27%.
 
-    Fix: overwrite the first/last N columns with copies from N columns
-    deeper into the interior, bypassing the LANCZOS edge artifact.
+       This is *not* a PIL LANCZOS edge artifact -- feeding a clean
+       synthetic 12960-wide image through the same resize leaves the edge
+       columns indistinguishable from the interior, and zeroing a whole
+       source column perturbs exactly one output column without spreading.
+       An earlier version of this function blamed LANCZOS; that diagnosis
+       was wrong.
+
+    2. **Column 0 and column W-1 are the same meridian.**
+       ``lon_grid = linspace(-180, 180, W)`` includes both endpoints, so
+       sample_bilinear's horizontal wrap (``x1 = (x0 + 1) % W``) is only
+       seamless when those two columns hold identical values.
+
+    The previous fix copied columns 3/4/5 onto 0/1/2 (and mirrored on the
+    right). That did remove the bad data, but because the copy source sits
+    *inside* the overwritten range the content ran
+    ``c3, c4, c5, c3, c4, c5, c6`` -- six columns that repeat once and jump
+    two columns backwards in the middle. Each row of the nx cubemap face
+    is one whole equirect column stretched across the full 1024 px width,
+    so that 0.43 degree band became a ~4-row stripe spanning the entire
+    face: a wide seam running from the north pole to the south pole
+    (nx's rows 511/512 are exactly lon 180, and the polar caps pz/nz
+    continue it into both poles).
+
+    Fix: rebuild the band {W-3, W-2, W-1, 0, 1, 2} by linear interpolation
+    in longitude between the last clean columns on either side (col 3 at
+    lon -179.784 and col W-4 at lon +179.784, 0.43 degrees apart), then
+    force column 0 and column W-1 to be identical. No duplication, no
+    backward jump, and the wrap is exactly periodic.
+
+    Must keep `col 0 == col W-1`: cubemap.sample_bilinear wraps with
+    ``x1 = (x0 + 1) % w``, so a mismatch between the two ends of the row
+    reappears as a seam at lon 180 in every face that straddles it.
     """
-    for i in range(n):
-        density[:, i] = density[:, n + i]           # col 0 = col n
-        density[:, -(i + 1)] = density[:, -(n + i + 1)]  # col -1 = col -(n+1)
-    logger.info(f"Edge fix: replaced {n} edge cols with interior copies")
+    w = density.shape[1]
+    # The last clean columns flanking the defective band, ordered west -> east.
+    # The band straddles lon 180 ({W-3, W-2, W-1} are +179.856..+180 and
+    # {0, 1, 2} are -180..-179.856), so its WESTERN neighbour is W-4
+    # (lon +179.784) and its EASTERN neighbour is col 3 (lon -179.784).
+    west = density[:, w - 4].astype(np.float32)      # lon +179.784
+    east = density[:, 3].astype(np.float32)          # lon -179.784
+    # Fractional longitude of each rebuilt column between the two anchors.
+    # W-1 and 0 are the same meridian (lon 180), so both take t = 0.5 and
+    # come out identical by construction.
+    for col, t in ((w - 3, 1.0 / 6), (w - 2, 2.0 / 6), (w - 1, 3.0 / 6),
+                   (0, 3.0 / 6), (1, 4.0 / 6), (2, 5.0 / 6)):
+        density[:, col] = np.clip(
+            np.rint((1.0 - t) * west + t * east), 0, 255).astype(np.uint8)
+    density[:, 0] = density[:, w - 1]
+    logger.info(f"Dateline repair: rebuilt 6 cols across lon 180 "
+                f"(col0==col{w - 1})")
     return density
 
 
@@ -131,12 +173,13 @@ def run_pipeline(api_key: str = ""):
           f"mean={density.mean():.1f}, "
           f"zeros={np.sum(density==0)/density.size*100:.1f}%")
 
-    # Step 3.5: Fix dateline edge artifact
-    density = fix_edges_copy(density)
+    # Step 3.5: Rebuild the defective dateline columns (replaces the old
+    # copy-based edge fix, which duplicated 3 columns and left a
+    # pole-to-pole seam). Called exactly once.
+    density = repair_dateline_seam(density)
 
     # Step 4: Cubemap projection
     print(f"\n[4/5] Equirectangular to cubemap...")
-    density = fix_edges_copy(density)
     ts_dir = OUTPUT_DIR / ts
     tiles_dir = ts_dir / "tiles"
     h, w = density.shape[:2]
