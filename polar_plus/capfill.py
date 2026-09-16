@@ -17,6 +17,7 @@ from PIL import Image
 from polar_plus.config import (
     SSEC_API_BASE, SSEC_WMS_URL,
     GAP_LAT_THRESHOLD, FEATHER_WIDTH,
+    GAP_DENSITY_THRESHOLD, GAP_FEATHER_PX,
     MERCATOR_LAT_HIGH, BBOX_LAT_TOP,
     TILE_Z, TILE_SIZE, N_TILES,
 )
@@ -185,7 +186,22 @@ def build_ssec_polar(gcc_timestamp: str, target_w: int, target_h: int,
     north_rows = _row_for_lat(GAP_LAT_THRESHOLD, target_h) - _row_for_lat(MERCATOR_LAT_HIGH, target_h)
     south_rows = _row_for_lat(-MERCATOR_LAT_HIGH, target_h) - _row_for_lat(-GAP_LAT_THRESHOLD, target_h)
     cap_n_rows = _row_for_lat(MERCATOR_LAT_HIGH, target_h) - _row_for_lat(BBOX_LAT_TOP, target_h)
-    cap_s_rows = _row_for_lat(-BBOX_LAT_TOP, target_h) - _row_for_lat(-MERCATOR_LAT_HIGH, target_h)
+    # Anchor each polar cap to its image edge (the pole) and derive its height
+    # from the 85° row, so cap and Mercator band are always adjacent. The old
+    # code anchored the north cap one row down ("89.9°" → row 1) and derived
+    # the south cap height by subtraction; both left a one-row gap that stayed
+    # permanently zero in the composite -- row 0 (+90.0°, the pole itself) and
+    # row 2431 (-85.03°, exactly where the two southern sources meet). A GCC
+    # hole landing on either row was "filled" with 0, i.e. a black line at the
+    # pole and at -85°S.
+    r_n = 0
+    cap_n_rows = _row_for_lat(MERCATOR_LAT_HIGH, target_h)
+    r_s = _row_for_lat(-MERCATOR_LAT_HIGH, target_h)
+    cap_s_rows = target_h - r_s
+    # The four bands must tile [0, target_h) with no gap and no overlap.
+    assert r_n == 0 and r_s + cap_s_rows == target_h
+    assert r_n + cap_n_rows == _row_for_lat(MERCATOR_LAT_HIGH, target_h)
+    assert _row_for_lat(-GAP_LAT_THRESHOLD, target_h) + south_rows == r_s
 
     north_big = np.array(Image.fromarray(north_eq).resize((target_w, north_rows), Image.LANCZOS))
     south_big = np.array(Image.fromarray(south_eq).resize((target_w, south_rows), Image.LANCZOS))
@@ -195,13 +211,11 @@ def build_ssec_polar(gcc_timestamp: str, target_w: int, target_h: int,
     ssec = np.zeros((target_h, target_w), dtype=np.uint8)
 
     # North: 85-89.9° cap + 60-85° Mercator
-    r_n = _row_for_lat(BBOX_LAT_TOP, target_h)
     ssec[r_n:r_n + cap_n_rows, :] = cap_n_big
     r_m_n = _row_for_lat(MERCATOR_LAT_HIGH, target_h)
     ssec[r_m_n:r_m_n + north_rows, :] = north_big
 
     # South: -89.9°~-85° cap (bottom-aligned) + -85°~-60° Mercator
-    r_s = target_h - cap_s_rows  # place at bottom edge
     ssec[r_s:r_s + cap_s_rows, :] = cap_s_big
     r_m_s = _row_for_lat(-GAP_LAT_THRESHOLD, target_h)
     ssec[r_m_s:r_m_s + south_rows, :] = south_big
@@ -215,18 +229,58 @@ def build_ssec_polar(gcc_timestamp: str, target_w: int, target_h: int,
 # Gap-fill with feathering
 # ---------------------------------------------------------------------------
 
+def _dilate8(mask: np.ndarray) -> np.ndarray:
+    """8-connected dilation by one pixel (no wrap-around at the poles)."""
+    h, w = mask.shape
+    p = np.pad(mask, 1, mode='edge')
+    out = mask.copy()
+    for dy in range(3):
+        for dx in range(3):
+            out |= p[dy:dy + h, dx:dx + w]
+    return out
+
+
+def _fill_alpha(mask: np.ndarray, px: int) -> np.ndarray:
+    """Blend weight map for the gap-fill.
+
+    1.0 everywhere inside ``mask`` (full SSEC), then a cosine ramp decaying
+    outwards, reaching exactly 0.0 at ``px`` pixels out. Without this the
+    fill ends on a hard step: inside is bright SSEC, outside is GCC, and the
+    two meet with no transition. The ramp drags a little SSEC into the GCC
+    side so the junction is a slope rather than an edge.
+
+    Deliberately asymmetric -- the ramp only ever goes OUTWARDS. Ramping
+    inwards would blend the hole's own near-zero GCC values (1..44, the very
+    ramp this fix exists for) back into the fill and re-create the dark ring.
+    """
+    alpha = np.zeros(mask.shape, dtype=np.float32)
+    alpha[mask] = 1.0
+    covered = mask.copy()
+    frontier = mask
+    for k in range(1, px + 1):
+        frontier = _dilate8(frontier) & ~covered
+        if not frontier.any():
+            break
+        alpha[frontier] = 0.5 * (1.0 + math.cos(math.pi * k / px))
+        covered |= frontier
+    return alpha
+
+
 def fill_gcc_gaps(gcc_density: np.ndarray,
                   lat_grid: np.ndarray,
                   lon_grid: np.ndarray,
                   gcc_timestamp: str,
                   api_key: str = "") -> np.ndarray:
-    """Fill zero-pixels in GCC polar regions with time-matched SSEC data.
+    """Fill holes in GCC polar regions with time-matched SSEC data.
 
     Algorithm:
-      1. Identify gaps: (gcc == 0) AND (|lat| > GAP_LAT_THRESHOLD)
+      1. Identify holes: (density < GAP_DENSITY_THRESHOLD) AND (|lat| > 60°).
+         The threshold matches the one run._post_process() zeroes out, so the
+         fill covers exactly the pixels that would otherwise render black.
       2. Build SSEC polar composite matching the GCC timestamp
-      3. Fill only the gap pixels with SSEC data
-      4. Cosine-feather gap edges (±FEATHER_WIDTH degrees)
+      3. Fill the hole pixels with SSEC data, with a cosine ramp just outside
+         the hole boundary so the two sources meet without a step
+      4. Fade the whole fill in over FEATHER_WIDTH degrees past 60°
 
     If SSEC download fails entirely, returns GCC unchanged (with holes).
 
@@ -242,14 +296,17 @@ def fill_gcc_gaps(gcc_density: np.ndarray,
     """
     target_h, target_w = gcc_density.shape
 
-    # 1. Identify polar gaps
+    # 1. Identify polar holes. `< GAP_DENSITY_THRESHOLD` (not `== 0`) on
+    #    purpose: it is the same predicate run._post_process() uses to decide
+    #    what is black, so the fill boundary lands exactly on the visible hole
+    #    boundary. See GAP_DENSITY_THRESHOLD in config.py.
     lat_abs = np.abs(lat_grid)
     polar_mask = lat_abs > GAP_LAT_THRESHOLD         # (H,) boolean
-    gap_mask = (gcc_density == 0) & polar_mask[:, np.newaxis]  # (H, W)
+    gap_mask = (gcc_density < GAP_DENSITY_THRESHOLD) & polar_mask[:, np.newaxis]
 
     gap_count = gap_mask.sum()
     polar_total = polar_mask.sum() * target_w
-    logger.info(f"GCC polar gaps (>|{GAP_LAT_THRESHOLD:.0f}|°): "
+    logger.info(f"GCC polar holes (<{GAP_DENSITY_THRESHOLD}, >|{GAP_LAT_THRESHOLD:.0f}|°): "
                 f"{gap_count}/{polar_total} pixels ({gap_count / max(polar_total, 1) * 100:.1f}%)")
 
     if gap_count == 0:
@@ -290,29 +347,25 @@ def fill_gcc_gaps(gcc_density: np.ndarray,
     else:
         logger.warning(f"LUT skip: only {valid.sum()} overlap samples")
 
-    # 5. Fill only the gap pixels
-    result = gcc_density.copy()
-    result[gap_mask] = ssec[gap_mask]
-    logger.info(f"Filled {gap_count} gap pixels with SSEC data")
+    # 5. Composite SSEC into GCC over the holes, with a cosine ramp just
+    #    outside the hole boundary so the two sources meet in a slope.
+    alpha = _fill_alpha(gap_mask, GAP_FEATHER_PX)
 
-    # 6. Cosine feather at gap edges
-    #    Find rows near the gap boundary and blend
-    lat_values = lat_grid.copy()
-    blend_rows = (lat_abs >= GAP_LAT_THRESHOLD) & (lat_abs <= GAP_LAT_THRESHOLD + FEATHER_WIDTH)
-    if blend_rows.any():
-        for y in np.where(blend_rows)[0]:
-            lat = abs(lat_values[y])
-            # w=0 at threshold (all GCC), w=1 at threshold+width (all SSEC for gaps)
-            w = (lat - GAP_LAT_THRESHOLD) / FEATHER_WIDTH
-            w = (1.0 - math.cos(w * math.pi)) / 2.0  # smoothstep
-            # Only blend at gap edges — where SSEC was used
-            row_gap = gap_mask[y]
-            if row_gap.any():
-                result[y, row_gap] = (
-                    gcc_density[y, row_gap] * (1.0 - w) +
-                    ssec[y, row_gap] * w
-                ).astype(np.uint8)
-        logger.info(f"Feather: {FEATHER_WIDTH}° cosine blend at gap edges")
+    #    The SSEC composite only exists for |lat| > 60°, so an outward ramp
+    #    crossing that line would multiply real mid-latitude GCC data by
+    #    (1 - alpha) and darken it into a band. The latitude ramp keeps the
+    #    blend at zero until the fill is genuinely inside SSEC coverage and
+    #    fades it in over FEATHER_WIDTH degrees (the role the old row-wise
+    #    feather played).
+    ramp = np.clip((lat_abs - GAP_LAT_THRESHOLD) / FEATHER_WIDTH, 0.0, 1.0)
+    ramp = (1.0 - np.cos(ramp * np.pi)) / 2.0
+    alpha *= ramp[:, np.newaxis]
+
+    result = np.rint(gcc_density.astype(np.float32) * (1.0 - alpha)
+                     + ssec.astype(np.float32) * alpha)
+    result = np.clip(result, 0, 255).astype(np.uint8)
+    logger.info(f"Filled {gap_count} hole pixels with SSEC "
+                f"({GAP_FEATHER_PX}px cosine feather at the fill edge)")
 
     logger.info(f"Final: zeros={(result == 0).sum() / result.size * 100:.1f}% "
                 f"(was {(gcc_density == 0).sum() / gcc_density.size * 100:.1f}%)")

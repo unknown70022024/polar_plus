@@ -3,19 +3,27 @@
 polar_plus/run.py — NASA GCC v2a + SSEC polar gap-fill pipeline
 
 Flow:
-  1. Find latest GCC v2a file (96h search, 30-min slots)
-  2. Remote-read BT_10.8um + cloud_phase via h5netcdf
+  0. Read the timestamp already published (root.json) — the backward-search
+     lower bound, so we never replace live data with something older
+  1. Find the newest GCC v2a file whose BT_10.8um is actually complete,
+     walking back an hour at a time (96h window, min age 2h)
+  2. Remote-read BT_10.8um + cloud_phase via h5py
   3. BT → cloud density + gamma correction
   4. Downsample to target equirectangular
   5. SSEC gap-fill: only fill pixels where GCC density==0 in polar regions
   6. Post-process (threshold + linear stretch)
   7. Cubemap projection → 6-face JPG
   8. Deploy to GitHub Pages (via GitHub Actions)
+
+If no complete GCC file can be found inside the allowed window, the process
+exits non-zero *without* publishing anything, so the previous deployment
+stays live rather than being replaced by partial data.
 """
 import json
 import logging
 import os
 import shutil
+import sys
 import time
 from pathlib import Path
 
@@ -23,10 +31,17 @@ import numpy as np
 from PIL import Image
 
 from polar_plus.config import (OUTPUT_DIR, FACE_SIZE, LON_OFFSET,
-                                TARGET_W, TARGET_H)
+                                TARGET_W, TARGET_H,
+                                ROOT_MARKER_KEY, ROOT_MARKER_VALUE)
 from polar_plus.cubemap import equirect_to_cubemap
-from polar_plus.gcc_load import load_gcc_density
+from polar_plus.gcc_load import NoHealthyGCCError, load_gcc_density
+from polar_plus.health import describe_floor, resolve_floor_ts
 from polar_plus.capfill import fill_gcc_gaps
+
+# Exit code used when no complete GCC file is available. Non-zero on purpose:
+# it fails the GitHub Actions job, which skips the deploy job entirely and
+# leaves GitHub Pages serving the previous good data.
+EXIT_NO_HEALTHY_GCC = 2
 
 
 def _post_process(density: np.ndarray, threshold: int = 45) -> np.ndarray:
@@ -136,10 +151,32 @@ def run_pipeline(api_key: str = ""):
 
     t0 = time.time()
 
+    # Step 0: lower bound for the backward search — the newest timestamp
+    # already published. Read before anything is downloaded. Never fatal:
+    # on a first run there is nothing to read and we simply run unbounded
+    # (bounded in practice by MAX_FALLBACK_HOURS).
+    #
+    # `bootstrap` is True when the live root.json exists but carries no
+    # publish marker, i.e. it was written by the old, ungated pipeline. That
+    # version can itself be a half-written file, and the bound would then
+    # block every healthy older candidate forever — so this first run drops
+    # both bounds, publishes the newest healthy file and writes the marker.
+    floor_ts, floor_src, bootstrap = resolve_floor_ts()
+    print(f"[0/5] 回退下界（线上已发布的时间戳）: "
+          f"{describe_floor(floor_ts, floor_src, bootstrap)}")
+
     # Step 1: GCC global data
-    print("[1/5] Loading GCC v2a global cloud composite...")
-    density, lat_grid, lon_grid, ts = load_gcc_density(
-        target_w=TARGET_W, target_h=TARGET_H)
+    print("\n[1/5] Loading GCC v2a global cloud composite...")
+    try:
+        density, lat_grid, lon_grid, ts = load_gcc_density(
+            target_w=TARGET_W, target_h=TARGET_H, floor_ts=floor_ts,
+            bootstrap=bootstrap)
+    except NoHealthyGCCError as exc:
+        logger.error(f"未找到 BT_10.8um 完整健康的 GCC 文件：{exc}")
+        logger.error("本次不产出、不发布；GitHub Pages 保持上一版数据")
+        print(f"\n[ABORT] {exc}")
+        print("本次不发布，线上数据保持不变。")
+        sys.exit(EXIT_NO_HEALTHY_GCC)
     print(f"  Density: {density.shape}, "
           f"zeros={np.sum(density==0)/density.size*100:.1f}%")
     print(f"  Lat: {lat_grid[0]:.1f} to {lat_grid[-1]:.1f}")
@@ -199,7 +236,11 @@ def run_pipeline(api_key: str = ""):
         repo_name = repo.split("/")[1] if "/" in repo else "polar_plus"
         base_url = f"https://{owner}.github.io/{repo_name}/tiles/"
 
-    root_data = {"baseUrl": base_url, "timestamp": ts}
+    # The marker tells the next run that this data came from a gated
+    # pipeline, so it can go back to normal bounded behaviour. See
+    # ROOT_MARKER_KEY in config.py.
+    root_data = {"baseUrl": base_url, "timestamp": ts,
+                 ROOT_MARKER_KEY: ROOT_MARKER_VALUE}
 
     # root.json → timestamped dir
     root_path = ts_dir / "root.json"

@@ -2,8 +2,8 @@
 polar_plus/gcc_load.py — NASA SatCORPS Global Cloud Composite (GCC) v2a
 
 Single-source global cloud cover, 90N-90S. Replaces GMGSI.
-Remote partial-read via h5netcdf — only downloads compressed chunks
-of BT_10.8um + cloud_phase (~96 MB), not the entire ~1.27 GB file.
+Remote partial-read via h5py — only the compressed chunks of BT_10.8um and
+cloud_phase are transferred (~100 MB), never the entire ~1.3 GB file.
 
 Data:
   - Source: NASA Langley SatCORPS
@@ -11,8 +11,20 @@ Data:
   - Grid: 12960×6480 regular equirectangular (~3 km at equator), 90N to -90S
   - Variables: BT_10.8um (10.8μm brightness temp, uint16+scale_factor 0.01)
                cloud_phase (uint8, 0=clear, 1=liquid, 2=ice, 3+=other)
-  - Latency: ~2h (GCC hourly updates, ~2h behind real-time)
   - Format: NetCDF4/HDF5 with chunked zlib compression
+
+Completeness — read this before changing the search logic:
+  NASA publishes each hourly file at HH:00Z but keeps rewriting it for hours
+  afterwards as late granules arrive (measured Last-Modified up to +8h). The
+  file also carries ~37 other science variables, so its size, Last-Modified
+  and granule counts say nothing about whether *our* variable is complete:
+  a file can look finalised while BT_10.8um is still missing entire latitude
+  bands, and a hole that big survives the SSEC polar gap-fill.
+  We therefore validate BT_10.8um itself while reading it (see health.py) and
+  walk back an hour at a time until one passes, never going older than the
+  timestamp already published (see health.resolve_floor_ts). If nothing
+  passes, load_gcc_density raises NoHealthyGCCError and the caller must abort
+  rather than publish partial data.
 """
 import logging
 import time
@@ -21,9 +33,32 @@ from datetime import datetime, timezone, timedelta
 import numpy as np
 
 from polar_plus.config import (GCC_V2A_BASE, BT_WARM, BT_COLD, SEARCH_HOURS,
-                               MIN_AGE_HOURS)
+                               MIN_AGE_HOURS, MAX_FALLBACK_HOURS,
+                               HEALTH_ENFORCE, HEALTH_DEAD_BLOCKS_MAX,
+                               HEALTH_STABLE_WAIT)
+from polar_plus.health import BtHealth, count_dead_blocks, evaluate_bt
 
 logger = logging.getLogger(__name__)
+
+# BT_10.8um geometry: (1, 6480, 12960) uint16, chunks (1, 1620, 3240).
+# One 1620-row band costs exactly 4 HDF5 chunks (the 4 longitude quadrants),
+# so a band is the cheapest unit that still spans every longitude. The
+# north band (lat 90..45N) is read first because every incomplete file we
+# have measured is missing high-latitude data first.
+BT_ROWS = 6480
+BT_COLS = 12960
+BT_BANDS = 4
+BT_BAND_ROWS = BT_ROWS // BT_BANDS      # 1620 == one HDF5 chunk row
+
+
+class NoHealthyGCCError(RuntimeError):
+    """No candidate file in the allowed window had a complete BT_10.8um."""
+
+
+class IncompleteGCCError(RuntimeError):
+    """A candidate file's BT_10.8um is incomplete — the file is still being
+    written. Raised instead of returning partial data so the caller can move
+    on to the previous hour."""
 
 
 def _gcc_url(dt: datetime) -> str:
@@ -38,43 +73,44 @@ def _gcc_url(dt: datetime) -> str:
             f"{yyyy}{doy}.{hhmm}.3km.nc")
 
 
-def find_latest_gcc(max_hours_back: int = SEARCH_HOURS,
-                    min_age_hours: int = MIN_AGE_HOURS) -> tuple:
-    """Scan recent hours for the latest FINALISED GCC v2a file.
+def iter_candidate_files(floor_dt: datetime = None,
+                         max_hours_back: int = SEARCH_HOURS,
+                         min_age_hours: int = MIN_AGE_HOURS,
+                         max_fallback_hours: int = MAX_FALLBACK_HOURS):
+    """Yield (datetime, url) candidates newest-first, bounded on both sides.
 
-    GCC v2a files are published hourly (HH:00) but keep growing for ~2h
-    as late-arriving LEO granules are appended (the file for hour H is
-    finalised around H+2h). Reading a younger, still-assembling file
-    returns corrupt chunks and large rectangular holes, so we skip any
-    file younger than min_age_hours.
+    The upper bound is ``min_age_hours`` (younger files are still being
+    written). The walk stops as soon as a candidate is no longer **newer**
+    than ``floor_dt`` — the newest timestamp already published — so live data
+    can never be replaced by something older.
 
-    Returns:
-        (datetime, url) or (None, None) if nothing found.
+    Args:
+        floor_dt: exclusive lower bound. None disables it, leaving only
+            ``max_fallback_hours`` as a guard (first run / no root.json).
+        max_hours_back: search window.
+        min_age_hours: skip files younger than this.
+        max_fallback_hours: absolute cap on the walk, applied even when
+            floor_dt is None.
+
+    Yields:
+        (dt, url) tuples, possibly none when the bounds leave no room; the
+        caller turns that into NoHealthyGCCError.
     """
+    if max_fallback_hours < min_age_hours:
+        logger.warning(f"max_fallback_hours={max_fallback_hours} < "
+                       f"min_age_hours={min_age_hours} —— 没有可搜索的候选")
+        return
+
     now = datetime.now(timezone.utc)
-    skipped = 0
-    for hours_ago in range(min_age_hours, max_hours_back + 1):
-        dt = now - timedelta(hours=hours_ago)
-        dt = dt.replace(minute=0, second=0, microsecond=0)
-        url = _gcc_url(dt)
-        try:
-            import urllib.request
-            req = urllib.request.Request(url, method='HEAD')
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                if resp.status == 200:
-                    logger.info(
-                        f"Found GCC: {dt.strftime('%Y-%m-%d %H:%M')}Z "
-                        f"(skipped {skipped} newer assembling slots, "
-                        f"searched back {hours_ago}h)"
-                    )
-                    return dt, url
-                else:
-                    skipped += 1
-        except Exception:
-            skipped += 1
-            continue
-    logger.warning(f"No GCC data found in past {max_hours_back}h ({skipped} slots checked)")
-    return None, None
+    upper = min(max_hours_back, max_fallback_hours)
+    for hours_ago in range(min_age_hours, upper + 1):
+        dt = (now - timedelta(hours=hours_ago)).replace(
+            minute=0, second=0, microsecond=0)
+        if floor_dt is not None and dt <= floor_dt:
+            logger.info(f"候选 {dt:%Y-%m-%d %H:%M}Z 已不晚于线上时间戳 "
+                        f"{floor_dt:%Y-%m-%d %H:%M}Z —— 停止向前搜索")
+            return
+        yield dt, _gcc_url(dt)
 
 
 def _head_gcc(url: str) -> tuple:
@@ -123,70 +159,137 @@ def _wait_stable(url: str, max_wait: int = 180, interval: int = 8) -> tuple:
     return prev
 
 
-def _read_needed_vars(url: str) -> tuple:
-    """Read only BT_10.8um + cloud_phase + lat/lon via h5py.
+def _read_bt_banded(h, enforce: bool = True) -> tuple:
+    """Read BT_10.8um band by band from an open h5py file, validating as we go.
 
-    Uses h5py directly instead of xarray's open_dataset, which decodes
-    every variable (including the variable-length string granule_name_list
-    that triggers fragile global-heap reads over HTTP). Only the ~100 MB
-    of compressed chunks for the two cloud fields are transferred.
+    Why banded: BT_10.8um is chunked (1, 1620, 3240), so one 1620-row band
+    costs exactly 4 HDF5 chunks. Reading a band at a time lets us detect a
+    still-being-written file after 4 of the 16 chunks instead of all 16 —
+    and on a healthy file it costs exactly the same as reading the whole
+    variable in one go, because the chunk set is identical.
+
+    The north band (lat 90..45N) is read first: every incomplete file we have
+    measured loses high-latitude data first, so that ordering maximises the
+    early-abort saving.
+
+    Args:
+        h: an open h5py.File for the remote file (shared with the caller so
+           the HDF5 handle is opened exactly once).
+        enforce: when False the gate only logs (shadow mode).
+
+    Returns:
+        (bt_float32_with_nan, health)
+
+    Raises:
+        IncompleteGCCError: when the accumulated dead-block count crosses
+            HEALTH_DEAD_BLOCKS_MAX and ``enforce`` is True. The caller never
+            reaches the cloud_phase read in that case.
+    """
+    t0 = time.time()
+    bt = np.empty((BT_ROWS, BT_COLS), dtype=np.float32)
+    dead_total = 0
+    for band in range(BT_BANDS):
+        r0 = band * BT_BAND_ROWS
+        raw = h['BT_10.8um'][0, r0:r0 + BT_BAND_ROWS, :]
+        invalid = (raw == 65535) | (raw < 18000) | (raw > 40000)
+        # Per-band contribution to the dead-block tally; the running total is
+        # monotone, so it is safe to abort on the partial value.
+        dead_band, worst = count_dead_blocks(invalid)
+        dead_total += dead_band
+        part = raw.astype(np.float32) * 0.01
+        part[invalid] = np.nan
+        bt[r0:r0 + BT_BAND_ROWS] = part
+        del raw, part
+        logger.info(
+            f"    BT band {band} (lat {90 - band * 45}..{90 - (band + 1) * 45}): "
+            f"无效率 {invalid.mean() * 100:5.1f}%, 死块 {dead_band:4d}, "
+            f"累计 {dead_total}")
+        if enforce and dead_total >= HEALTH_DEAD_BLOCKS_MAX:
+            raise IncompleteGCCError(
+                f"BT_10.8um 在第 {band} 带（lat "
+                f"{90 - band * 45}..{90 - (band + 1) * 45}）即累计 "
+                f"{dead_total} 个死块，判定文件未写完"
+                f"（已读 {(band + 1) * 4}/16 chunk）")
+
+    health = evaluate_bt(np.isnan(bt))
+    logger.info(f"    BT_10.8um 读毕 {bt.shape} in {time.time() - t0:.0f}s, "
+                f"BT {np.nanmin(bt):.1f}~{np.nanmax(bt):.1f}K, "
+                f"{health.summary()}")
+    return bt, health
+
+
+def _read_candidate(url: str, enforce: bool = True) -> tuple:
+    """Read BT_10.8um (validated) + cloud_phase + lat/lon via h5py.
+
+    Uses h5py directly instead of xarray's open_dataset, which decodes every
+    variable (including the variable-length string granule_name_list that
+    triggers fragile global-heap reads over HTTP).
+
+    BT_10.8um is read and validated first; cloud_phase is only fetched once
+    BT has passed, so an incomplete file never pays for cloud_phase's 9
+    chunks. Transfer stays partial (~100 MB of compressed chunks for a good
+    file); the full ~1.3 GB file is never downloaded.
+
+    Raises:
+        IncompleteGCCError: BT_10.8um is incomplete (see _read_bt_banded).
     """
     import fsspec
     import h5py
 
-    t0 = time.time()
-    fs = fsspec.filesystem("http", block_size=1024 * 1024)  # 1 MB blocks
+    # 8 MB blocks: the 1 MB setting was needed only while we might read a
+    # file mid-write; candidates are now content-validated, so fewer, larger
+    # requests cut the round-trip count on a high-latency link.
+    fs = fsspec.filesystem("http", block_size=8 * 1024 * 1024)
     with fs.open(url, "rb") as f:
-        with h5py.File(f, "r") as h:
-            bt_raw = h['BT_10.8um'][0, :, :]    # (6480, 12960) uint16
+        with h5py.File(f, "r") as h:          # opened exactly once
+            bt, health = _read_bt_banded(h, enforce=enforce)
             cp_raw = h['cloud_phase'][0, :, :]  # (6480, 12960) uint8
             lat = h['lat'][:]                   # (6480,)
             lon = h['lon'][:]                   # (12960,)
 
-    # scale_factor + _FillValue / valid_range -> float Kelvin + NaN
-    bt = bt_raw.astype(np.float32) * 0.01
-    bt[(bt_raw == 65535) | (bt_raw < 18000) | (bt_raw > 40000)] = np.nan
     cp = cp_raw.astype(np.float32)
     cp[(cp_raw == 127) | (cp_raw > 13)] = np.nan
 
-    logger.info(
-        f"Read BT_10.8um+phase: {bt.shape} in {time.time() - t0:.0f}s, "
-        f"BT {np.nanmin(bt):.1f}~{np.nanmax(bt):.1f}K, "
-        f"cloud={(cp >= 1).sum() / cp.size * 100:.0f}%"
-    )
-    return bt, cp, lat, lon
+    logger.info(f"    cloud_phase: cloud={(cp >= 1).sum() / cp.size * 100:.0f}%")
+    return bt, cp, lat, lon, health
 
 
-def read_gcc_bt(url: str, max_retries: int = 3) -> tuple:
+def read_gcc_bt(url: str, max_retries: int = 3, enforce: bool = None) -> tuple:
     """Read BT_10.8um + cloud_phase with a stability gate + retry.
 
     Flow:
-      1. Wait until the file stops changing (stability gate).
-      2. Read only the needed variables (h5py direct).
-      3. HEAD again: if the signature changed, the file was rewritten
-         mid-read -> discard and retry.
+      1. Short stability probe: wait for two matching HEAD signatures.
+      2. Read BT_10.8um band by band, validating as we go.
+      3. Read cloud_phase + lat/lon only once BT has passed.
+      4. HEAD again: if the signature moved, the file was rewritten mid-read
+         -> discard and retry.
+
+    IncompleteGCCError is deliberately **not** retried: retrying the same hour
+    cannot help, so it propagates to the caller, which walks back an hour.
 
     Returns:
-        bt_k: (6480, 12960) float32 Kelvin (NaN where invalid)
-        cloud_phase: (6480, 12960) float32, 0=clear, 1=liquid, 2=ice, ...
-        lat: (6480,) float32
-        lon: (12960,) float32
+        (bt_k, cloud_phase, lat, lon, health) where bt_k is
+        (6480, 12960) float32 Kelvin with NaN where invalid.
     """
+    if enforce is None:
+        enforce = HEALTH_ENFORCE
     for attempt in range(max_retries):
-        before = _wait_stable(url)
+        before = _wait_stable(url, max_wait=HEALTH_STABLE_WAIT)
         try:
-            bt, cp, lat, lon = _read_needed_vars(url)
+            bt, cp, lat, lon, health = _read_candidate(url, enforce=enforce)
+        except IncompleteGCCError:
+            raise
         except Exception as e:
-            logger.warning(f"Read attempt {attempt + 1}/{max_retries} failed: {e}")
+            logger.warning(f"    Read attempt {attempt + 1}/{max_retries} "
+                           f"failed: {type(e).__name__}: {e}")
             time.sleep(2 ** attempt)
             continue
         after = _head_gcc(url)
         if after == before:
-            return bt, cp, lat, lon
+            return bt, cp, lat, lon, health
         logger.warning(
-            f"GCC file changed during read (attempt {attempt + 1}/{max_retries}), "
-            f"retrying..."
-        )
+            f"    GCC file changed during read (attempt {attempt + 1}/"
+            f"{max_retries}), retrying...")
     raise RuntimeError(
         f"GCC file could not be read stably after {max_retries} attempts: {url}"
     )
@@ -255,32 +358,97 @@ def _downsample(density: np.ndarray, target_w: int, target_h: int) -> np.ndarray
 def load_gcc_density(target_w: int = 5000,
                      target_h: int = 2500,
                      max_hours_back: int = SEARCH_HOURS,
-                     use_cloud_phase: bool = True) -> tuple:
-    """Main entry: find latest GCC → read BT → convert to density → downsample.
+                     use_cloud_phase: bool = True,
+                     floor_ts: datetime = None,
+                     bootstrap: bool = False) -> tuple:
+    """Main entry: find newest *complete* GCC → BT → density → downsample.
+
+    Walks candidate hours newest-first, and for each one validates
+    BT_10.8um's spatial coverage before accepting it. A candidate that is
+    still being written (large regions of _FillValue) is rejected and the
+    walk continues to the previous hour, stopping once the candidate is no
+    longer newer than ``floor_ts`` (the newest data already published).
 
     Args:
         target_w, target_h: Output equirectangular dimensions.
         max_hours_back: Search window in hours.
         use_cloud_phase: Whether to use cloud_phase to zero out clear pixels.
+        floor_ts: Exclusive lower bound for the backward walk; pass the
+            timestamp read from root.json. None disables the bound.
+        bootstrap: First run of this pipeline against data published by the
+            old one. Both bounds are dropped — the live version is known to
+            be ungated (it may itself be a half-written file, which would
+            otherwise block every healthy older candidate forever), so pick
+            the newest file that passes the gate and publish it. Bounded only
+            by ``max_hours_back``.
 
     Returns:
         (density, lat_grid, lon_grid, timestamp_str)
-        density: (target_h, target_w) uint8 cloud density
-        lat_grid: (target_h,) float64
-        lon_grid: (target_w,) float64
-        timestamp_str: "YYYYMMDD_HHMMSS" format
+
+    Raises:
+        NoHealthyGCCError: no candidate in the allowed window had a complete
+            BT_10.8um. The caller must abort without publishing anything.
     """
-    # 1. Find latest file
-    dt, url = find_latest_gcc(max_hours_back)
-    if dt is None:
-        raise RuntimeError(
-            f"No GCC v2a data found in past {max_hours_back}h")
+    # 1. Walk candidate hours newest-first until one validates.
+    chosen = None
+    tried = []
+    n_candidates = 0
+    if bootstrap:
+        logger.warning(
+            f"初次运行（线上数据由旧版管线发布，无本版本标记）：忽略下界与 "
+            f"{MAX_FALLBACK_HOURS}h 搜索上限，在 {max_hours_back}h 内取最新的"
+            f"健康文件强行发布 —— 此后恢复正常的界的约束")
+        candidates = iter_candidate_files(
+            None, max_hours_back, max_fallback_hours=max_hours_back)
+    else:
+        candidates = iter_candidate_files(floor_ts, max_hours_back)
+    for dt, url in candidates:
+        n_candidates += 1
+        sig = _head_gcc(url)
+        if sig is None or sig[0] is None:
+            logger.info(f"  {dt:%Y-%m-%d %H:%M}Z 不存在，继续向前搜索")
+            continue
+        logger.info(f"  → 尝试 {dt:%Y-%m-%d %H:%M}Z "
+                    f"({int(sig[0]) / 1e6:.0f} MB)")
+        try:
+            bt_k, cloud_phase, lat_src, lon_src, health = read_gcc_bt(
+                url, enforce=HEALTH_ENFORCE)
+        except IncompleteGCCError as e:
+            logger.warning(f"  ✗ {dt:%Y-%m-%d %H:%M}Z BT_10.8um 不完整：{e}")
+            tried.append(dt)
+            continue
+        except Exception as e:
+            logger.warning(f"  ✗ {dt:%Y-%m-%d %H:%M}Z 读取失败："
+                           f"{type(e).__name__}: {e}")
+            tried.append(dt)
+            continue
+        chosen = (dt, bt_k, cloud_phase, lat_src, lon_src, health)
+        break
 
+    if chosen is None:
+        bound = (floor_ts.strftime('%Y-%m-%d %H:%M') + 'Z') if floor_ts else '无'
+        if n_candidates == 0:
+            # Benign: the published timestamp already covers the whole
+            # searchable window, so there is simply nothing newer to publish.
+            raise NoHealthyGCCError(
+                f"没有可搜索的候选：线上已发布的时间戳 {bound} 已经覆盖了整个"
+                f"搜索窗口，没有更新的文件可发布 —— 本次无需更新")
+        detail = ", ".join(f"{d:%m-%d %H:%M}Z" for d in tried) or "（均无法读取）"
+        raise NoHealthyGCCError(
+            f"在允许范围内找不到 BT_10.8um 完整的 GCC 文件。"
+            f"下界={bound}，共 {n_candidates} 个候选，其中 "
+            f"{len(tried)} 个不完整/不可用：{detail}")
+
+    dt, bt_k, cloud_phase, lat_src, lon_src, health = chosen
     timestamp_str = dt.strftime("%Y%m%d_%H%M%S")
-    logger.info(f"Latest GCC: {dt.strftime('%Y-%m-%d %H:%M')}Z — {timestamp_str}")
-
-    # 2. Remote-read BT + cloud_phase
-    bt_k, cloud_phase, lat_src, lon_src = read_gcc_bt(url)
+    age_h = (datetime.now(timezone.utc) - dt).total_seconds() / 3600
+    if tried:
+        logger.info(f"选中 GCC {dt:%Y-%m-%d %H:%M}Z（{timestamp_str}，"
+                    f"数据龄 {age_h:.1f}h）—— 向前回退跳过了 "
+                    f"{len(tried)} 个不完整/不可用文件")
+    else:
+        logger.info(f"选中 GCC {dt:%Y-%m-%d %H:%M}Z（{timestamp_str}，"
+                    f"数据龄 {age_h:.1f}h）—— 最新定稿文件即完整")
 
     # 3. BT → density (with cloud_phase filtering)
     density = _bt_to_density(bt_k, cloud_phase,
