@@ -3,3 +3,9 @@ __pycache__/
 output/
 *.nc
 .env
+
+# 本地 Android 工程（298 MB，含 build 产物），不参与数据管线
+rewrite/
+
+# 本地临时脚本
+tbash
