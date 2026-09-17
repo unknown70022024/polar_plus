@@ -59,12 +59,13 @@ from datetime import datetime, timedelta, timezone
 
 import numpy as np
 
-from polar_plus.config import (FLOOR_TS_ENV, HEALTH_DEAD_BLOCKS_MAX,
+from polar_plus.config import (DEV_VERSION, FLOOR_TS_ENV,
+                               HEALTH_DEAD_BLOCKS_MAX,
                                HEALTH_DEAD_SUBBLOCK_FRAC,
                                HEALTH_GLOBAL_INVALID_MAX, HEALTH_SUB_COLS,
                                HEALTH_SUB_ROWS, LEGACY_MARKER_KEY, OUTPUT_DIR,
-                               PIPELINE_VERSION, ROOT_TS_TIMEOUT,
-                               ROOT_VERSION_KEY, public_base_url)
+                               ROOT_TS_TIMEOUT, ROOT_VERSION_KEY, VERSION_ENV,
+                               pipeline_version, public_base_url)
 
 logger = logging.getLogger(__name__)
 
@@ -165,9 +166,16 @@ def evaluate_bt(invalid: np.ndarray) -> BtHealth:
 def parse_ts(value) -> datetime | None:
     """Parse a root.json timestamp. Returns None for anything unusable.
 
-    Strictly validates the shape first and round-trips the result, so a
-    truncated value like "20260915_1435" is rejected rather than silently
-    read as 14:03:05 (see _TS_RE).
+    Two legal shapes, both of which the pipeline has actually written at some
+    point: ``YYYYMMDD_HHMMSS`` and ``YYYYMMDD_HHMM``.
+
+    The shape is pinned by a regex rather than left to strptime, which is far
+    too lenient here: ``%M`` and ``%S`` both accept a single digit, so
+    ``strptime("20260915_1435", "%Y%m%d_%H%M%S")`` returns 14:03:05 (H=14,
+    M=3, S=5) instead of failing. The format is therefore chosen by the
+    matched length, and the result is round-tripped back to text as a final
+    guard. A value that is neither shape — truncated, hand-edited, with
+    separators — is rejected rather than silently misread.
     """
     if not isinstance(value, str):
         return None
@@ -342,17 +350,18 @@ def resolve_floor_ts() -> tuple[datetime | None, str, bool]:
         (floor, source, bootstrap).
 
         ``bootstrap`` is True when the live root.json was produced by a
-        *different* pipeline version than the one running now — including the
-        case where it carries no version at all (data written by the old,
-        unversioned pipeline). In that case the floor is dropped: the live
-        data may itself be exactly what this version exists to replace, and
-        keeping the bound would block the fix forever. The run then picks the
-        newest healthy file, force-publishes it, and writes its own version,
-        so every later run goes back to normal bounded operation.
+        *different* build than the one running now — including the case where
+        it carries no version at all (data written by the old, unversioned
+        pipeline). In that case the floor is dropped: the live data may itself
+        be exactly what this build exists to replace, and keeping the bound
+        would block the fix forever. The run then picks the newest healthy
+        file, force-publishes it, and writes its own version, so every later
+        run goes back to normal bounded operation.
 
         The search window (SEARCH_HOURS) still applies during bootstrap, so
         this can never publish genuinely stale data.
     """
+    running, version_src = pipeline_version()
     raw = (os.environ.get(FLOOR_TS_ENV) or "").strip()
     if raw:
         if raw.lower() in ("none", "off", "disable", "disabled"):
@@ -365,14 +374,21 @@ def resolve_floor_ts() -> tuple[datetime | None, str, bool]:
         else:
             return _clamp_future(forced, FLOOR_TS_ENV), f"{FLOOR_TS_ENV}={raw}", False
     ts, source, version = read_deployed_state()
-    if ts is not None and version != PIPELINE_VERSION:
+    if ts is not None and version != running:
         if version is None:
             reason = ("线上 root.json 没有版本标记（数据由未版本化的"
                       "旧管线产生）")
+        elif version.startswith("legacy:"):
+            reason = (f"线上 root.json 用的是旧的 gate 标记 "
+                      f"({version.split(':', 1)[1]})")
         else:
-            reason = f"线上版本 {version} ≠ 本次运行版本 {PIPELINE_VERSION}"
+            reason = f"线上版本 {version} ≠ 本次运行版本 {running}"
+        hint = ""
+        if running == DEV_VERSION:
+            hint = (f"；本次运行也没能识别自己的构建"
+                    f"（可设 {VERSION_ENV} 或重新构建镜像）")
         logger.warning(
-            f"{reason} —— 判定为本版本的初次运行，"
+            f"{reason}{hint} —— 判定为本构建的初次运行，"
             f"忽略回退下界（搜索窗口仍然生效），"
             f"将发布窗口内最新的健康文件")
         return None, source, True
@@ -381,9 +397,10 @@ def resolve_floor_ts() -> tuple[datetime | None, str, bool]:
 
 def describe_floor(ts: datetime | None, source: str, bootstrap: bool = False) -> str:
     """One-line log/console rendering of the resolved lower bound."""
+    running, version_src = pipeline_version()
     if bootstrap:
-        return (f"未设下界（{source} → 版本 {PIPELINE_VERSION} 的初次运行，"
+        return (f"未设下界（{source} → 版本 {running} 的初次运行，"
                 f"忽略回退下界，发布窗口内最新健康文件）")
     if ts is None:
         return f"未设回退下界（{source}）"
-    return f"{ts:%Y-%m-%d %H:%M}Z（{source}）"
+    return f"{ts:%Y-%m-%d %H:%M}Z（{source}，版本 {running}）"

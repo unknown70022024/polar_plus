@@ -6,7 +6,7 @@ Flow:
   0. Read the timestamp already published (root.json) — the backward-search
      lower bound, so we never replace live data with something older
   1. Find the newest GCC v2a file whose BT_10.8um is actually complete,
-     walking back an hour at a time (96h window, min age 2h)
+     walking back an hour at a time (48h window, min age 2h)
   2. Remote-read BT_10.8um + cloud_phase via h5py
   3. BT → cloud density + gamma correction
   4. Downsample to target equirectangular
@@ -34,9 +34,11 @@ from PIL import Image
 
 from polar_plus.config import (OUTPUT_DIR, FACE_SIZE, LON_OFFSET,
                                 TARGET_W, TARGET_H,
-                                ROOT_MARKER_KEY, ROOT_MARKER_VALUE,
+                                ROOT_VERSION_KEY,
                                 TILES_SUBPATH, LOCAL_BASE_URL_FALLBACK,
-                                describe_base_url, public_base_url)
+                                DEFAULT_VERSION_FILE, DEV_VERSION, VERSION_ENV,
+                                describe_base_url, pipeline_version,
+                                public_base_url)
 from polar_plus.cubemap import equirect_to_cubemap
 from polar_plus.gcc_load import NoHealthyGCCError, load_gcc_density
 from polar_plus.health import describe_floor, resolve_floor_ts
@@ -151,7 +153,12 @@ def save_faces(faces: dict, tiles_dir: Path):
 
 def run_pipeline(api_key: str = ""):
     """GCC v2a + SSEC gap-fill pipeline."""
-    print("=== NASA GCC v2a + SSEC Polar Gap-Fill Pipeline ===\n")
+    print("=== NASA GCC v2a + SSEC Polar Gap-Fill Pipeline ===")
+    # Printed before any work: which build is running decides whether the
+    # backward-search floor applies at all, so it belongs at the top of the log
+    # rather than buried at the end.
+    _version, _version_src = pipeline_version()
+    print(f"    build: {_version}  (来源: {_version_src})\n")
 
     t0 = time.time()
 
@@ -244,12 +251,18 @@ def run_pipeline(api_key: str = ""):
     base_url = f"{site_base}/{TILES_SUBPATH}/"
     print(f"  [PUBLISH TARGET] {describe_base_url()}")
 
-    # Record which pipeline version produced this data. The next run compares
-    # it against its own PIPELINE_VERSION: a mismatch (or no version at all)
-    # means "first run of a new version", which drops the backward-search
-    # floor once. See ROOT_VERSION_KEY / PIPELINE_VERSION in config.py.
+    # Record which build produced this data. The next run compares it against
+    # its own version: a mismatch (or no version at all) means "first run of a
+    # new build", which drops the backward-search floor once. The value is the
+    # git commit the code was built from — see pipeline_version() in config.py.
+    running_version, _ = pipeline_version()
+    if running_version == DEV_VERSION:
+        logger.warning(
+            "无法识别本次运行的构建版本（既无 %s，也无 %s，且没有 git 仓库）"
+            "—— root.json 将写入 %r，此后每次运行都会被判为初次运行",
+            VERSION_ENV, DEFAULT_VERSION_FILE, DEV_VERSION)
     root_data = {"baseUrl": base_url, "timestamp": ts,
-                 ROOT_MARKER_KEY: ROOT_MARKER_VALUE}
+                 ROOT_VERSION_KEY: running_version}
 
     # root.json → timestamped dir
     root_path = ts_dir / "root.json"

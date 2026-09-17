@@ -2,6 +2,9 @@
 polar_plus/config.py — GCC pipeline configuration.
 """
 import os
+import re
+import subprocess
+from functools import lru_cache
 from pathlib import Path
 
 _default_output = Path(__file__).resolve().parent / "output"
@@ -173,7 +176,7 @@ HEALTH_ENFORCE = os.environ.get("POLAR_HEALTH_ENFORCE", "1").strip().lower() \
 # files are still being written) and steps back one hour at a time, newest
 # first, keeping the first file whose BT_10.8um passes the completeness gate.
 # It stops early once the candidate is no longer newer than the already
-# published floor (see ROOT_MARKER_KEY below), and hard-stops at this window.
+# published floor (see ROOT_VERSION_KEY below), and hard-stops at this window.
 #
 # Why 48 hours rather than something tighter: NASA's archive produces runs of
 # damaged files lasting a day or more. On 2026-09-15/16, 15:00Z and 14:00Z were
@@ -202,45 +205,165 @@ ROOT_TS_TIMEOUT = 15      # seconds — per root.json fetch
 FLOOR_TS_ENV = "POLAR_FLOOR_TS"
 
 # ---------------------------------------------------------------------------
-# Publish marker — how a run recognises that it is the first of this version
+# Publish marker — how a run recognises that it is the first of this build
 # ---------------------------------------------------------------------------
-# Every root.json this pipeline writes carries the pipeline version that
+# Every root.json this pipeline writes carries the identity of the code that
 # produced it. The marker is not a boolean but a version string, because
 # "is this the first run?" is really the question "was the live data produced
-# by a pipeline whose behaviour matches mine?".
+# by a build whose behaviour matches mine?".
 #
-#   live root.json WITHOUT a version        → first run of a versioned pipeline
-#   live root.json WITH a DIFFERENT version → first run after a behaviour change
+#   live root.json WITHOUT a version        → first run of a marked build
+#   live root.json WITH A DIFFERENT version → first run of a new build
 #   live root.json WITH THE SAME version    → normal, bounded operation
 #
 # Why this matters: the backward search refuses to publish anything older than
 # what is live. That is right when the code is unchanged, but after a change
 # that alters which data we would pick — a new completeness gate, a new data
-# source, a new search window — the live version may itself be exactly the
-# thing the new code exists to replace, and the bound would block the fix
-# forever. So the first run of a new version ignores the floor, picks the
-# newest healthy file and force-publishes it; that run writes the new version
-# and every run after it applies the bounds normally.
+# source, a new search window — the live data may itself be exactly the thing
+# the new code exists to replace, and the bound would block the fix forever.
+# So the first run of a new build ignores the floor, picks the newest healthy
+# file and force-publishes it; that run writes its own marker and every run
+# after it applies the bounds normally.
 #
 # The search window (SEARCH_HOURS) still applies during bootstrap, so this can
-# never publish genuinely stale data.
+# never publish genuinely stale data: the worst a bootstrap can do is move the
+# live timestamp back within the window, and the run after it moves forward
+# again.
 #
-# IMPORTANT — bump PIPELINE_VERSION by hand, deliberately. Do NOT derive it
-# from git, an image tag or a content hash: every commit or rebuild would then
-# look like a new version, the floor would never apply, and the pipeline could
-# republish older data on every single run.
+# The version IS the git commit the code was built from. That is deliberate:
+#   * it is automatic — it cannot be forgotten, and it cannot drift from the
+#     code, which a hand-maintained number can and eventually will;
+#   * it is checkable — the string in root.json can be resolved to a diff, so
+#     "why did the pipeline publish that?" becomes a question with an answer;
+#   * the cost is that EVERY commit looks like a new build, so each distinct
+#     commit resets the floor once on its first run. Accepted deliberately:
+#     the window still bounds how far back that can go.
 #
-# Bump it when a change makes the already-published data something the new
-# code would not have chosen. Examples:
-#   2.0.0  completeness gate redesign + 48h window + three-source lightning
-PIPELINE_VERSION = os.environ.get("POLAR_PIPELINE_VERSION",
-                                  "2.0.0").strip() or "2.0.0"
+# KNOWN GAP — a container image cannot work this out by itself. `.git` is
+# excluded from the build context, so a container has neither a repository nor
+# GITHUB_SHA and would resolve to "dev" on every run, disabling the floor
+# permanently (loudly: it warns, and it bootstraps every time). Whatever builds
+# the image must therefore stamp the commit in explicitly, via either
+# POLAR_VERSION or a file at POLAR_VERSION_FILE. Nothing in this repo does that
+# yet — azure/ is unchanged and still runs an unversioned image, which is fine
+# only because it has not been rebuilt since.
+VERSION_ENV = "POLAR_VERSION"
+VERSION_FILE_ENV = "POLAR_VERSION_FILE"
+CI_SHA_ENV = "GITHUB_SHA"      # set by Actions; free, exact, and read-only
+DEFAULT_VERSION_FILE = "/app/version.txt"
+DEV_VERSION = "dev"            # nothing identified the build → always bootstrap
+_SHORT_SHA_LEN = 12            # git's own default abbreviation
+_HEX_RE = re.compile(r"^[0-9a-f]{7,40}$")
+
+
+def _normalise_version(raw: str | None) -> str | None:
+    """Canonicalise a version string, or None if it is unusable.
+
+    A full 40-char SHA is shortened to 12 (git's default abbreviation) so the
+    value written into root.json stays short while a 12-char value coming back
+    from an older marker still compares equal. Anything else — a hand-typed
+    string, an image tag like ``v6`` — is passed through verbatim: it will not
+    equal a SHA and so will bootstrap once, which is the safe direction.
+    """
+    if raw is None:
+        return None
+    value = str(raw).strip()
+    if not value:
+        return None
+    low = value.lower()
+    if _HEX_RE.match(low):
+        return low[:_SHORT_SHA_LEN]
+    return value
+
+
+def is_commit_version(value: str | None) -> bool:
+    """True when a version marker looks like a commit rather than a free string."""
+    return bool(value) and _HEX_RE.match(str(value).lower()) is not None
+
+
+def _version_from_git() -> tuple[str | None, bool]:
+    """``(git rev-parse HEAD, working tree dirty)`` for a source checkout.
+
+    Guarded by an existence check on ``.git`` so a container (where the
+    directory is excluded from the build context) fails fast instead of
+    forking a doomed subprocess on every run.
+    """
+    repo_root = Path(__file__).resolve().parent.parent
+    if not (repo_root / ".git").exists():
+        return None, False
+    try:
+        head = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=5, check=False)
+        if head.returncode != 0:
+            return None, False
+        status = subprocess.run(
+            ["git", "-C", str(repo_root), "status", "--porcelain"],
+            capture_output=True, text=True, timeout=5, check=False)
+    except Exception:                              # noqa: BLE001 - defensive
+        return None, False
+    dirty = status.returncode == 0 and bool(status.stdout.strip())
+    return _normalise_version(head.stdout), dirty
+
+
+def _version_from_file() -> str | None:
+    """The commit baked into the image at build time, else None."""
+    path = Path(os.environ.get(VERSION_FILE_ENV) or DEFAULT_VERSION_FILE)
+    try:
+        if not path.is_file():
+            return None
+        return _normalise_version(path.read_text(encoding="utf-8"))
+    except Exception:                              # noqa: BLE001 - defensive
+        return None
+
+
+@lru_cache(maxsize=1)
+def pipeline_version() -> tuple[str, str]:
+    """Identity of the running code → (version, where it came from).
+
+    Resolution order, first hit wins:
+
+      1. ``POLAR_VERSION``           — explicit override, e.g. re-running a
+                                       deployed revision by hand.
+      2. the build-time file         — what the image was built from, when a
+         (``/app/version.txt``)        container build baked one in. Outranks
+                                       everything below because the marker
+                                       must describe the *deployed* code, and
+                                       a developer's checkout is often ahead
+                                       of it.
+      3. ``GITHUB_SHA``              — exact and free on Actions, and it does
+                                       not depend on checkout metadata.
+      4. ``git rev-parse HEAD``      — any other source checkout.
+      5. ``dev``                     — nothing identified the build. Every run
+                                       then sees a mismatch and bootstraps,
+                                       which is loud and obvious rather than
+                                       silently disabling the floor for good.
+
+    Cached because it is called from several modules and must never differ
+    between them within one run.
+    """
+    explicit = _normalise_version(os.environ.get(VERSION_ENV))
+    if explicit:
+        return explicit, VERSION_ENV
+    baked = _version_from_file()
+    if baked:
+        return baked, f"{os.environ.get(VERSION_FILE_ENV) or DEFAULT_VERSION_FILE}"
+    ci_sha = _normalise_version(os.environ.get(CI_SHA_ENV))
+    if ci_sha:
+        return ci_sha, CI_SHA_ENV
+    from_git, dirty = _version_from_git()
+    if from_git:
+        src = "git HEAD"
+        if dirty:
+            src += "（工作区有未提交改动）"
+        return from_git, src
+    return DEV_VERSION, "未识别的构建"
+
+
 ROOT_VERSION_KEY = "version"
 
 # The pre-version key, kept only so a run can say *why* it is bootstrapping.
 LEGACY_MARKER_KEY = "gate"
-ROOT_MARKER_KEY = ROOT_VERSION_KEY      # backwards-compatible alias
-ROOT_MARKER_VALUE = PIPELINE_VERSION    # ditto
 
 # ---------------------------------------------------------------------------
 # SSEC RealEarth — polar gap-fill backup
