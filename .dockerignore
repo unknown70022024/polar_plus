@@ -1,0 +1,16 @@
+# .dockerignore — the build context is the repo root, which also contains
+# rewrite/ (~298 MB of Android sources and build output). None of it belongs
+# in the image, and shipping it would make every build slow.
+*
+!polar_plus/
+!azure/
+!requirements.txt
+
+# never ship generated output, caches or VCS metadata
+polar_plus/output/
+polar_plus/__pycache__/
+**/__pycache__/
+**/*.pyc
+.git/
+.gitignore
+rewrite/

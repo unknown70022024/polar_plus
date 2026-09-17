@@ -1,0 +1,25 @@
+# Runtime dependencies for the pipeline container.
+#
+# This is deliberately much smaller than the repo-root requirements.txt, which
+# still lists packages the pipeline never imports (netCDF4, xarray, h5netcdf,
+# requests). Verified by grepping every import in polar_plus/:
+#
+#   numpy, PIL            direct
+#   fsspec, h5py          direct (gcc_load.py, imported inside the function)
+#   aiohttp               fsspec's HTTP backend
+#
+# netCDF4 is NOT needed: gcc_load.py reads BT_10.8um with h5py directly
+# instead of going through xarray, and gmgsi_load.py (the only module that
+# wants xarray/boto3) is dead code — nothing imports it.
+numpy
+Pillow
+fsspec
+aiohttp
+h5py
+
+# Publishing backends.
+#   azure-storage-blob + azure-identity  -> the `blob` target
+# The `swa` target shells out to the Static Web Apps CLI (installed in the
+# Dockerfile) and needs nothing here.
+azure-storage-blob
+azure-identity
