@@ -36,10 +36,12 @@ jobs:
           OUTPUT_DIR: ${{ github.workspace }}/output
           GH_PAGES_BASE: ${{ vars.GH_PAGES_BASE }}
 
-      - name: Fetch Blitzortung storm data
-        run: python polar_plus/fetch_storms.py
+      - name: Fetch lightning (GOES GLM + EUMETSAT MTG LI + Blitzortung)
+        run: python -m polar_plus.lightning.pipeline
         env:
           OUTPUT_DIR: ${{ github.workspace }}/output
+          EUMETSAT_CONSUMER_KEY: ${{ secrets.EUMETSAT_CONSUMER_KEY }}
+          EUMETSAT_CONSUMER_SECRET: ${{ secrets.EUMETSAT_CONSUMER_SECRET }}
 
       - name: Fetch NOAA aurora oval data
         run: python polar_plus/fetch_aurora.py
