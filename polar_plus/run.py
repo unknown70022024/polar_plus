@@ -13,7 +13,9 @@ Flow:
   5. SSEC gap-fill: only fill pixels where GCC density==0 in polar regions
   6. Post-process (threshold + linear stretch)
   7. Cubemap projection → 6-face JPG
-  8. Deploy to GitHub Pages (via GitHub Actions)
+  8. Stage output/latest for publishing (the publisher uploads that tree; the
+     site root comes from POLAR_PUBLIC_BASE_URL, so the target host is not
+     baked into this module)
 
 If no complete GCC file can be found inside the allowed window, the process
 exits non-zero *without* publishing anything, so the previous deployment
@@ -32,15 +34,17 @@ from PIL import Image
 
 from polar_plus.config import (OUTPUT_DIR, FACE_SIZE, LON_OFFSET,
                                 TARGET_W, TARGET_H,
-                                ROOT_MARKER_KEY, ROOT_MARKER_VALUE)
+                                ROOT_MARKER_KEY, ROOT_MARKER_VALUE,
+                                TILES_SUBPATH, LOCAL_BASE_URL_FALLBACK,
+                                describe_base_url, public_base_url)
 from polar_plus.cubemap import equirect_to_cubemap
 from polar_plus.gcc_load import NoHealthyGCCError, load_gcc_density
 from polar_plus.health import describe_floor, resolve_floor_ts
 from polar_plus.capfill import fill_gcc_gaps
 
 # Exit code used when no complete GCC file is available. Non-zero on purpose:
-# it fails the GitHub Actions job, which skips the deploy job entirely and
-# leaves GitHub Pages serving the previous good data.
+# it fails the run so that nothing is published, leaving the live site
+# serving the previous good data.
 EXIT_NO_HEALTHY_GCC = 2
 
 
@@ -154,7 +158,7 @@ def run_pipeline(api_key: str = ""):
     # Step 0: lower bound for the backward search — the newest timestamp
     # already published. Read before anything is downloaded. Never fatal:
     # on a first run there is nothing to read and we simply run unbounded
-    # (bounded in practice by MAX_FALLBACK_HOURS).
+    # (bounded in practice by SEARCH_HOURS).
     #
     # `bootstrap` is True when the live root.json exists but carries no
     # publish marker, i.e. it was written by the old, ungated pipeline. That
@@ -173,7 +177,7 @@ def run_pipeline(api_key: str = ""):
             bootstrap=bootstrap)
     except NoHealthyGCCError as exc:
         logger.error(f"未找到 BT_10.8um 完整健康的 GCC 文件：{exc}")
-        logger.error("本次不产出、不发布；GitHub Pages 保持上一版数据")
+        logger.error("本次不产出、不发布；线上保持上一版数据")
         print(f"\n[ABORT] {exc}")
         print("本次不发布，线上数据保持不变。")
         sys.exit(EXIT_NO_HEALTHY_GCC)
@@ -187,7 +191,8 @@ def run_pipeline(api_key: str = ""):
     Image.fromarray(density, mode='L').save(raw_path)
     print(f"\n  Saved GCC source: {raw_path}")
 
-    # Emit GCC timestamp for downstream fetch_storms.py (GitHub Actions GITHUB_ENV)
+    # Emit GCC timestamp for the downstream lightning fusion (the container
+    # entrypoint parses this, or reads it back out of root.json)
     print(f"GCC_TS={ts}")
 
     # Step 2: SSEC polar gap-fill
@@ -226,19 +231,23 @@ def run_pipeline(api_key: str = ""):
     print(f"\n[5/5] Saving faces...")
     save_faces(faces, tiles_dir)
 
-    # Build root.json with GitHub Pages URL
-    gh_pages_base = os.environ.get("GH_PAGES_BASE", "")
-    if gh_pages_base:
-        base_url = f"{gh_pages_base.rstrip('/')}/tiles/"
-    else:
-        repo = os.environ.get("GITHUB_REPOSITORY", "owner/polar_plus")
-        owner = repo.split("/")[0].lower()
-        repo_name = repo.split("/")[1] if "/" in repo else "polar_plus"
-        base_url = f"https://{owner}.github.io/{repo_name}/tiles/"
+    # Build root.json. `baseUrl` is the only field that has to change when
+    # the hosting moves, which is why the client (which reads it from
+    # root.json) needs no rebuild to follow the tiles to a new host.
+    site_base = public_base_url()
+    if site_base is None:
+        site_base = LOCAL_BASE_URL_FALLBACK
+        logger.warning(
+            "没有配置公开站点地址，root.json 将写入占位地址 %s —— "
+            "请在发布前设置 %s", LOCAL_BASE_URL_FALLBACK,
+            describe_base_url())
+    base_url = f"{site_base}/{TILES_SUBPATH}/"
+    print(f"  [PUBLISH TARGET] {describe_base_url()}")
 
-    # The marker tells the next run that this data came from a gated
-    # pipeline, so it can go back to normal bounded behaviour. See
-    # ROOT_MARKER_KEY in config.py.
+    # Record which pipeline version produced this data. The next run compares
+    # it against its own PIPELINE_VERSION: a mismatch (or no version at all)
+    # means "first run of a new version", which drops the backward-search
+    # floor once. See ROOT_VERSION_KEY / PIPELINE_VERSION in config.py.
     root_data = {"baseUrl": base_url, "timestamp": ts,
                  ROOT_MARKER_KEY: ROOT_MARKER_VALUE}
 

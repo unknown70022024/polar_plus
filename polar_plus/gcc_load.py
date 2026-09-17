@@ -33,9 +33,9 @@ from datetime import datetime, timezone, timedelta
 import numpy as np
 
 from polar_plus.config import (GCC_V2A_BASE, BT_WARM, BT_COLD, SEARCH_HOURS,
-                               MIN_AGE_HOURS, MAX_FALLBACK_HOURS,
-                               HEALTH_ENFORCE, HEALTH_DEAD_BLOCKS_MAX,
-                               HEALTH_STABLE_WAIT)
+                               MIN_AGE_HOURS, HEALTH_ENFORCE,
+                               HEALTH_DEAD_BLOCKS_MAX,
+                               GCC_SIZE_FILTER_RATIO)
 from polar_plus.health import BtHealth, count_dead_blocks, evaluate_bt
 
 logger = logging.getLogger(__name__)
@@ -75,35 +75,34 @@ def _gcc_url(dt: datetime) -> str:
 
 def iter_candidate_files(floor_dt: datetime = None,
                          max_hours_back: int = SEARCH_HOURS,
-                         min_age_hours: int = MIN_AGE_HOURS,
-                         max_fallback_hours: int = MAX_FALLBACK_HOURS):
+                         min_age_hours: int = MIN_AGE_HOURS):
     """Yield (datetime, url) candidates newest-first, bounded on both sides.
 
-    The upper bound is ``min_age_hours`` (younger files are still being
-    written). The walk stops as soon as a candidate is no longer **newer**
-    than ``floor_dt`` — the newest timestamp already published — so live data
-    can never be replaced by something older.
+    The walk starts at the most recent eligible hour and steps back one hour
+    at a time. The near bound is ``min_age_hours`` (files younger than this are
+    still being written, so they are skipped). The walk stops as soon as a
+    candidate is no longer **newer** than ``floor_dt`` — the newest timestamp
+    already published — so live data can never be replaced by something older,
+    and hard-stops after ``max_hours_back`` hours regardless.
 
     Args:
-        floor_dt: exclusive lower bound. None disables it, leaving only
-            ``max_fallback_hours`` as a guard (first run / no root.json).
-        max_hours_back: search window.
+        floor_dt: exclusive lower bound. None disables it (first run, or a
+            live site with no root.json yet), leaving max_hours_back as the
+            only limit.
+        max_hours_back: search window, in hours.
         min_age_hours: skip files younger than this.
-        max_fallback_hours: absolute cap on the walk, applied even when
-            floor_dt is None.
 
     Yields:
         (dt, url) tuples, possibly none when the bounds leave no room; the
         caller turns that into NoHealthyGCCError.
     """
-    if max_fallback_hours < min_age_hours:
-        logger.warning(f"max_fallback_hours={max_fallback_hours} < "
-                       f"min_age_hours={min_age_hours} —— 没有可搜索的候选")
+    if max_hours_back < min_age_hours:
+        logger.warning(f"搜索窗口 {max_hours_back}h < 最小文件年龄 "
+                       f"{min_age_hours}h —— 没有可搜索的候选")
         return
 
     now = datetime.now(timezone.utc)
-    upper = min(max_hours_back, max_fallback_hours)
-    for hours_ago in range(min_age_hours, upper + 1):
+    for hours_ago in range(min_age_hours, max_hours_back + 1):
         dt = (now - timedelta(hours=hours_ago)).replace(
             minute=0, second=0, microsecond=0)
         if floor_dt is not None and dt <= floor_dt:
@@ -132,31 +131,6 @@ def _head_gcc(url: str) -> tuple:
     except Exception as e:
         logger.warning(f"GCC HEAD failed: {e}")
         return None
-
-
-def _wait_stable(url: str, max_wait: int = 180, interval: int = 8) -> tuple:
-    """Wait until two consecutive HEAD signatures match.
-
-    NASA regenerates the hourly composite in place (late-arriving LEO
-    granules are appended), so the file grows while it is being written.
-    Reading a mid-regeneration file produces corrupt chunks and large
-    rectangular holes. This gate waits until the file stops changing
-    before returning its signature.
-    """
-    prev = _head_gcc(url)
-    deadline = time.time() + max_wait
-    while time.time() < deadline:
-        time.sleep(interval)
-        cur = _head_gcc(url)
-        if cur is not None and cur == prev:
-            return cur
-        if cur is not None and prev is not None:
-            logger.info(
-                f"GCC file changing, waiting for stability... ({prev} -> {cur})"
-            )
-        prev = cur
-    logger.warning(f"GCC file did not stabilise within {max_wait}s")
-    return prev
 
 
 def _read_bt_banded(h, enforce: bool = True) -> tuple:
@@ -254,18 +228,32 @@ def _read_candidate(url: str, enforce: bool = True) -> tuple:
     return bt, cp, lat, lon, health
 
 
-def read_gcc_bt(url: str, max_retries: int = 3, enforce: bool = None) -> tuple:
-    """Read BT_10.8um + cloud_phase with a stability gate + retry.
+def read_gcc_bt(url: str, max_retries: int = 3, enforce: bool = None,
+                 before_sig: tuple = None) -> tuple:
+    """Read BT_10.8um + cloud_phase, verifying the file did not change mid-read.
 
     Flow:
-      1. Short stability probe: wait for two matching HEAD signatures.
-      2. Read BT_10.8um band by band, validating as we go.
-      3. Read cloud_phase + lat/lon only once BT has passed.
-      4. HEAD again: if the signature moved, the file was rewritten mid-read
-         -> discard and retry.
+      1. Read BT_10.8um band by band, validating as we go.
+      2. Read cloud_phase + lat/lon only once BT has passed.
+      3. HEAD again: if the signature moved, the file was rewritten during the
+         read -> discard and retry.
+
+    Step 3 is the whole correctness mechanism, and it is why there is no
+    "wait for the file to stop growing" probe any more. NASA does rewrite each
+    hourly file in place for hours, but the write is caught by comparing the
+    HEAD signature taken before the read with the one taken after it: if they
+    differ, nothing from that read is used. A half-written file also fails on
+    its own — either decompression errors out, or BT_10.8um is full of
+    _FillValue and the completeness gate rejects it.
 
     IncompleteGCCError is deliberately **not** retried: retrying the same hour
     cannot help, so it propagates to the caller, which walks back an hour.
+
+    Args:
+        before_sig: HEAD signature already taken by the caller (the candidate
+            walk HEADs every file anyway to read Content-Length). Reusing it
+            saves a round trip on the first attempt; retries take a fresh one,
+            since the point of a retry is that the file may have moved.
 
     Returns:
         (bt_k, cloud_phase, lat, lon, health) where bt_k is
@@ -274,7 +262,8 @@ def read_gcc_bt(url: str, max_retries: int = 3, enforce: bool = None) -> tuple:
     if enforce is None:
         enforce = HEALTH_ENFORCE
     for attempt in range(max_retries):
-        before = _wait_stable(url, max_wait=HEALTH_STABLE_WAIT)
+        before = before_sig if (attempt == 0 and before_sig is not None) \
+            else _head_gcc(url)
         try:
             bt, cp, lat, lon, health = _read_candidate(url, enforce=enforce)
         except IncompleteGCCError:
@@ -355,6 +344,84 @@ def _downsample(density: np.ndarray, target_w: int, target_h: int) -> np.ndarray
     return np.array(img, dtype=np.uint8)
 
 
+def _reference_size(floor_ts: datetime) -> int:
+    """Content-Length of the currently published file, or 0 if unknown.
+
+    The live file is the right reference for the size heuristic because it is
+    known to have passed the completeness gate, so the derived threshold
+    tracks any change in NASA's output size instead of hard-coding one.
+    """
+    if floor_ts is None:
+        return 0
+    sig = _head_gcc(_gcc_url(floor_ts))
+    if sig is None or sig[0] is None:
+        return 0
+    try:
+        return int(sig[0])
+    except (TypeError, ValueError):
+        return 0
+
+
+def _size_floor(floor_ts: datetime) -> int:
+    """Byte threshold below which a candidate is assumed truncated (0 = off)."""
+    if GCC_SIZE_FILTER_RATIO <= 0:
+        return 0
+    ref = _reference_size(floor_ts)
+    if ref <= 0:
+        logger.info("  没有可用的参考大小（线上文件未知），本次不做大小预筛")
+        return 0
+    return int(ref * GCC_SIZE_FILTER_RATIO)
+
+
+def _walk_candidates(candidates, size_floor: int):
+    """Try candidates newest-first until one passes the gate.
+
+    Returns (chosen, tried, skipped_by_size, n_seen, n_existing). ``chosen`` is
+    the tuple the caller wants, or None. ``n_existing`` counts candidates that
+    actually had a file (a successful HEAD), which is what the caller needs to
+    tell "the size filter rejected everything" from "everything really was
+    damaged".
+    """
+    chosen = None
+    tried = []
+    skipped = []
+    n_seen = 0
+    n_existing = 0
+    for dt, url in candidates:
+        n_seen += 1
+        sig = _head_gcc(url)
+        if sig is None or sig[0] is None:
+            logger.info(f"  {dt:%Y-%m-%d %H:%M}Z 不存在，继续向前搜索")
+            continue
+        n_existing += 1
+        try:
+            size = int(sig[0])
+        except (TypeError, ValueError):
+            size = 0
+        if size_floor and size and size < size_floor:
+            logger.info(
+                f"  {dt:%Y-%m-%d %H:%M}Z 只有 {size / 1e6:.0f} MB，低于阈值 "
+                f"{size_floor / 1e6:.0f} MB（参考线上文件），判定截断，跳过")
+            skipped.append(dt)
+            continue
+        logger.info(f"  → 尝试 {dt:%Y-%m-%d %H:%M}Z ({size / 1e6:.0f} MB)")
+        try:
+            bt_k, cloud_phase, lat_src, lon_src, health = read_gcc_bt(
+                url, enforce=HEALTH_ENFORCE, before_sig=sig)
+        except IncompleteGCCError as e:
+            logger.warning(f"  ✗ {dt:%Y-%m-%d %H:%M}Z BT_10.8um 不完整：{e}")
+            tried.append(dt)
+            continue
+        except Exception as e:
+            logger.warning(f"  ✗ {dt:%Y-%m-%d %H:%M}Z 读取失败："
+                           f"{type(e).__name__}: {e}")
+            tried.append(dt)
+            continue
+        chosen = (dt, bt_k, cloud_phase, lat_src, lon_src, health)
+        break
+    return chosen, tried, skipped, n_seen, n_existing
+
+
 def load_gcc_density(target_w: int = 5000,
                      target_h: int = 2500,
                      max_hours_back: int = SEARCH_HOURS,
@@ -376,11 +443,12 @@ def load_gcc_density(target_w: int = 5000,
         floor_ts: Exclusive lower bound for the backward walk; pass the
             timestamp read from root.json. None disables the bound.
         bootstrap: First run of this pipeline against data published by the
-            old one. Both bounds are dropped — the live version is known to
-            be ungated (it may itself be a half-written file, which would
-            otherwise block every healthy older candidate forever), so pick
-            the newest file that passes the gate and publish it. Bounded only
-            by ``max_hours_back``.
+            old one. Drops the floor — the live version is known to be ungated
+            (it may itself be a half-written file, which would otherwise block
+            every healthy older candidate forever), so pick the newest file
+            that passes the gate and publish it. Still bounded by
+            ``max_hours_back``, which is what stops it publishing genuinely
+            stale data.
 
     Returns:
         (density, lat_grid, lon_grid, timestamp_str)
@@ -390,40 +458,44 @@ def load_gcc_density(target_w: int = 5000,
             BT_10.8um. The caller must abort without publishing anything.
     """
     # 1. Walk candidate hours newest-first until one validates.
-    chosen = None
-    tried = []
-    n_candidates = 0
     if bootstrap:
         logger.warning(
-            f"初次运行（线上数据由旧版管线发布，无本版本标记）：忽略下界与 "
-            f"{MAX_FALLBACK_HOURS}h 搜索上限，在 {max_hours_back}h 内取最新的"
-            f"健康文件强行发布 —— 此后恢复正常的界的约束")
-        candidates = iter_candidate_files(
-            None, max_hours_back, max_fallback_hours=max_hours_back)
-    else:
-        candidates = iter_candidate_files(floor_ts, max_hours_back)
-    for dt, url in candidates:
-        n_candidates += 1
-        sig = _head_gcc(url)
-        if sig is None or sig[0] is None:
-            logger.info(f"  {dt:%Y-%m-%d %H:%M}Z 不存在，继续向前搜索")
-            continue
-        logger.info(f"  → 尝试 {dt:%Y-%m-%d %H:%M}Z "
-                    f"({int(sig[0]) / 1e6:.0f} MB)")
-        try:
-            bt_k, cloud_phase, lat_src, lon_src, health = read_gcc_bt(
-                url, enforce=HEALTH_ENFORCE)
-        except IncompleteGCCError as e:
-            logger.warning(f"  ✗ {dt:%Y-%m-%d %H:%M}Z BT_10.8um 不完整：{e}")
-            tried.append(dt)
-            continue
-        except Exception as e:
-            logger.warning(f"  ✗ {dt:%Y-%m-%d %H:%M}Z 读取失败："
-                           f"{type(e).__name__}: {e}")
-            tried.append(dt)
-            continue
-        chosen = (dt, bt_k, cloud_phase, lat_src, lon_src, health)
-        break
+            f"初次运行（线上数据由旧版管线发布，无本版本标记）：忽略已发布下界，"
+            f"在最近 {max_hours_back}h 内取最新的健康文件强行发布 —— "
+            f"此后恢复正常的下界约束")
+    # bootstrap only drops the floor; the window is the same either way.
+    walk_floor = None if bootstrap else floor_ts
+
+    def _candidates():
+        # Fresh generator per pass: iter_candidate_files yields lazily and a
+        # consumed generator cannot be replayed.
+        return iter_candidate_files(walk_floor, max_hours_back)
+
+    size_floor = _size_floor(walk_floor)
+    if size_floor:
+        logger.info(f"  大小预筛开启：低于 {size_floor / 1e6:.0f} MB 的候选"
+                    f"（参考线上文件）直接跳过，不下载")
+    chosen, tried, skipped, n_candidates, n_existing = _walk_candidates(
+        _candidates(), size_floor)
+
+    # Safety valve. The size threshold is a heuristic; if NASA ever changes its
+    # output size, a stale threshold would skip every candidate and the
+    # pipeline would silently stop publishing.
+    #
+    # The trigger is deliberately narrow: only when the filter skipped EVERY
+    # candidate that existed. If even one file was downloaded and rejected on
+    # its content, the gate is doing its job and the filter was not the thing
+    # standing in the way — re-walking then would just double the run for
+    # nothing (measured: it did exactly that on 2026-09-16 17:30).
+    #
+    # So the filter may delay a publish, never prevent one.
+    if chosen is None and skipped and len(skipped) == n_existing:
+        logger.warning(
+            f"  大小预筛把 {n_existing} 个存在的候选全部跳过了且没有找到健康文件 "
+            f"—— 关闭预筛重新完整校验（阈值可能已过时）")
+        chosen, tried2, _, n2, _ = _walk_candidates(_candidates(), 0)
+        tried = tried + tried2
+        n_candidates += n2
 
     if chosen is None:
         bound = (floor_ts.strftime('%Y-%m-%d %H:%M') + 'Z') if floor_ts else '无'

@@ -32,7 +32,7 @@ SECTOR_RES_DEG = 5
 SECTOR_COUNT = 360 // SECTOR_RES_DEG  # 72
 
 REQUEST_HEADERS = {
-    "User-Agent": "AuroraPipeline/1.0 (GitHub Actions)",
+    "User-Agent": "AuroraPipeline/1.0 (polar_plus)",
     "Accept": "application/json",
 }
 REQUEST_TIMEOUT = 30
