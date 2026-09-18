@@ -1,20 +1,33 @@
 name: Polar Plus Pipeline
 
 on:
-  schedule:
-    # Every 2 hours at :48 past (explicit hours — avoids GitHub cron parser issues with */2).
-    # :48 leaves 48 min of margin after the selected GCC file finalises on the
-    # hour (the file for HH:00Z stops growing at HH+2:00Z); the old :13 left only 13 min.
-    - cron: '48 0,2,4,6,8,10,12,14,16,18,20,22 * * *'
-  workflow_dispatch:  # Manual trigger for testing
+  # Triggered from outside by the Azure Container Apps job `polar-trigger`
+  # (see azure/trigger/). Azure owns the clock; GitHub owns the compute.
+  #
+  # GitHub's own `schedule:` was removed deliberately. Measured over 13 days
+  # (60 scheduled runs, 2026-09-06..09-18) it fired 2-6 times a day out of the
+  # 12 requested, with a median gap of 4.57h and a worst gap of 7.90h against a
+  # 2h design interval — roughly 60% of the schedule dropped silently, and
+  # every run late. An external POST starts a run in ~1.4s instead.
+  workflow_dispatch:  # manual runs, and the Azure trigger's entry point
 
 permissions:
   contents: read
+
+# One pipeline at a time. A dispatch arriving mid-run waits rather than racing
+# it — two concurrent runs would both try to deploy Pages. GitHub keeps at most
+# one running plus one pending per group, so a burst of triggers collapses to
+# at most one queued run instead of building a backlog.
+concurrency:
+  group: polar-pipeline
+  cancel-in-progress: false
 
 jobs:
   pipeline:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    outputs:
+      published: ${{ steps.cloud.outputs.published }}
 
     steps:
       - uses: actions/checkout@v4
@@ -29,14 +42,41 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Run polar_plus cloud pipeline
+        id: cloud
         run: |
+          set +e
           python -m polar_plus.run
-          echo "GCC_TIMESTAMP=$(python -c "import json; print(json.load(open('output/latest/root.json'))['timestamp'])")" >> $GITHUB_ENV
-        env:
-          OUTPUT_DIR: ${{ github.workspace }}/output
-          GH_PAGES_BASE: ${{ vars.GH_PAGES_BASE }}
+          rc=$?
+          set -e
 
+          # Exit 2 is the completeness gate reporting no healthy GCC file in
+          # the window. That is a NORMAL outcome, not a fault: nothing is
+          # published and the live site keeps serving its previous version.
+          #
+          # azure/entrypoint.sh has swallowed this code from the start
+          # (POLAR_NO_DATA_EXIT=0). This workflow used to let it fail the job,
+          # which turned every quiet round red. That is not just cosmetic: it
+          # would bury real failures under alerts, and quiet rounds are common
+          # whenever NASA's archive is behind.
+          if [ "$rc" -eq 2 ]; then
+            echo "::notice::no healthy GCC file this round — nothing to publish"
+            echo "published=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::pipeline failed with exit code $rc"
+            exit "$rc"
+          fi
+
+          TS=$(python -c "import json; print(json.load(open('output/latest/root.json'))['timestamp'])")
+          echo "GCC_TIMESTAMP=$TS" >> "$GITHUB_ENV"
+          echo "published=true" >> "$GITHUB_OUTPUT"
+
+      # Everything below only means anything if the pipeline actually staged a
+      # new tree. Gating on the flag keeps `output/latest` from being uploaded
+      # or deployed when it holds a stale or absent tree.
       - name: Fetch lightning (GOES GLM + EUMETSAT MTG LI + Blitzortung)
+        if: steps.cloud.outputs.published == 'true'
         run: python -m polar_plus.lightning.pipeline
         env:
           OUTPUT_DIR: ${{ github.workspace }}/output
@@ -44,17 +84,22 @@ jobs:
           EUMETSAT_CONSUMER_SECRET: ${{ secrets.EUMETSAT_CONSUMER_SECRET }}
 
       - name: Fetch NOAA aurora oval data
+        if: steps.cloud.outputs.published == 'true'
         run: python polar_plus/fetch_aurora.py
         env:
           OUTPUT_DIR: ${{ github.workspace }}/output
 
       - name: Upload Pages artifact
+        if: steps.cloud.outputs.published == 'true'
         uses: actions/upload-pages-artifact@v3
         with:
           path: output/latest
 
   deploy:
     needs: pipeline
+    # No new data means no deployment — the live site must keep serving the
+    # previous good version rather than an empty or stale tree.
+    if: needs.pipeline.outputs.published == 'true'
     runs-on: ubuntu-latest
     permissions:
       pages: write
