@@ -1,6 +1,6 @@
 # 定时触发的拆分：Azure 管时钟，GitHub 管算力
 
-> 状态：代码、Azure 侧配置与工作流均已就位并**端到端验证通过**；仅**包可见性**待手动改一次（见第 6 节）。
+> 状态：**全部完成并端到端验证通过**，包括状态页。唯一遗留是下文提到的本机网络访问限制。
 > `azure/OPERATIONS.md` 描述的是拆分之前的架构，仍然准确，但不再是当前形态。
 
 ## 0. 验证记录
@@ -174,14 +174,17 @@ curl -s -H "Authorization: Bearer $T" \
 而 fine-grained PAT 是按仓库授权的，**拿不到 ghcr 包权限**——等于强迫这个 token 永远做 classic。
 改成 public 之后，派发用的 token 才能收缩成"只授权 polar_plus、只给 `Actions: write`"。
 
-### 当前状态：临时用了 registry 凭据
+### 已解决：临时用过 registry 凭据
 
-`polar-trigger` 是**带着 registry 凭据**建起来的，因为 Azure 在创建时就校验拉取，
-私有镜像根本建不出任务。这不增加任何暴露面——凭据复用的就是派发用的那同一个 secret
-`gh-dispatch-token`，本来就存在这个任务里。
+`polar-trigger` 最初是**带着 registry 凭据**建起来的，因为 Azure 在创建时就校验拉取，
+私有镜像根本建不出任务。当时没有增加暴露面——凭据复用的就是派发用的那同一个
+secret `gh-dispatch-token`，本来就存在这个任务里。
 
-改成 public 之后**要把这个凭据摘掉**，否则轮换 token 时还得额外维护它，而且新 token
-必须是 classic：
+包改成 public 之后凭据**已经摘掉**，现在 `registries: []`，`secrets` 里只剩
+`gh-dispatch-token` 一个。所以轮换 token 时不需要额外维护任何东西，新 token 也不必
+是 classic。
+
+确认当前状态（`registries` 应为空）：
 
 ```bash
 # 确认包已是 public（匿名 token 长度约 68，private 为 0）
@@ -257,24 +260,81 @@ az containerapp job logs show -n polar-trigger -g polar-plus-rg \
 [trigger] run: #554 queued https://github.com/.../runs/35321411133
 ```
 
-## 10. 告警（唯一的缺口）
+## 10. 观测：状态页
 
-现在 Azure 的触发任务是**唯一**的调度来源。它坏掉 = 管线停摆，而且不会有人知道。必须配：
+现在 Azure 触发任务是**唯一**的调度来源，它坏掉 = 管线停摆。没有配邮件告警
+（按你的选择），改成一张网页，把最近 12 条记录摆出来。
+
+**<https://polar-trigger-status.salmonbush-152eb6de.eastasia.azurecontainerapps.io/>**
+
+页面并排显示两个权威来源：
+
+| 列 | 来源 | 回答的问题 |
+|---|---|---|
+| 一、Azure 时钟 | ARM API 的执行记录 | 时钟到底响了没有 |
+| 二、GitHub 管线运行 | GitHub 公开 API | 管线到底跑了没有 |
+
+**并排看才是重点**：Azure 有记录而 GitHub 没有对应 run，说明派发被接受了但 GitHub
+没跑起来；Azure 那一列出现缺口，说明时钟本身漏了。只看一边都发现不了。
+
+页面还会算出**相邻执行的间隔**（中位数 / 均值 / 最大值），直接对照 2 小时的设计间隔
+——这正是 GitHub 自身 cron 守不住的那个数。
+
+### 它是怎么搭的
+
+| 资源 | 说明 |
+|---|---|
+| Container App `polar-trigger-status` | 与触发任务**共用同一个镜像**（第二个入口 `status_app.py`，用 `--command` 指定），所以只需要一个包是 public |
+| 系统托管身份 | `az containerapp create --system-assigned` |
+| 角色 | 该身份在 `polar-trigger` 上有 **Reader**——只够读执行记录 |
+| 缩容 | `min-replicas 0`，没人看时缩到零，平时不产生计算费用 |
+| 端点 | `/` 页面 · `/data.json` 原始数据 · `/healthz` 探针 |
+
+**这个容器里没有任何凭据**——ARM 用托管身份认证，GitHub 那列读的是公开仓库、无需认证。
+这是刻意的：能读执行记录的网页不该同时握着一个能派发的 token。
 
 ```bash
-az monitor action-group create -n polar-alerts -g polar-plus-rg \
-  --short-name polar --email-receiver name=me email=<邮箱>
+az containerapp create -n polar-trigger-status -g polar-plus-rg \
+  --environment polar-plus-env \
+  --image ghcr.io/unknown70022024/polar-plus-trigger:<tag> \
+  --command python --args /app/status_app.py \
+  --ingress external --target-port 8080 \
+  --min-replicas 0 --max-replicas 1 \
+  --cpu 0.25 --memory 0.5Gi \
+  --env-vars "SUBSCRIPTION_ID=$SUB" RESOURCE_GROUP=polar-plus-rg \
+               JOB_NAME=polar-trigger GH_REPO=unknown70022024/polar_plus \
+  --system-assigned
 
-az monitor metrics alert create -n polar-trigger-failed -g polar-plus-rg \
-  --scopes "$(az containerapp job show -n polar-trigger -g polar-plus-rg --query id -o tsv)" \
-  --condition "count JobExecutionFailed > 0" \
-  --window-size 1h --evaluation-frequency 15m \
-  --action "$(az monitor action-group show -n polar-alerts -g polar-plus-rg --query id -o tsv)"
+az role assignment create \
+  --assignee-object-id "$(az containerapp show -n polar-trigger-status -g polar-plus-rg \
+      --query identity.principalId -o tsv)" \
+  --assignee-principal-type ServicePrincipal \
+  --role Reader \
+  --scope "$(az containerapp job show -n polar-trigger -g polar-plus-rg --query id -o tsv)"
 ```
 
-具体指标名以门户里该任务实际可用的为准。
+### 已验证
 
-**告警只盯 Azure 触发任务，不要盯 GitHub 的 run 失败。** 见下一节。
+* 从**保加利亚 / 德国 / 西班牙 / 俄罗斯 / 以色列 / 意大利 / 波兰 / 荷兰**等外部节点
+  访问 `/` 与 `/data.json` 均返回 HTTP 200
+* 容器日志确认托管身份那条路是通的：
+  `[status] azure ok: 4 executions, 3 gaps` 与 `[status] github ok: 12 runs`
+
+### 一个已知的网络限制（重要）
+
+**本机打不开这个页面。** 到 `20.24.241.26:443` 的 TCP 被 RST（80/8080/22 同样），
+traceroute 到第 12 跳进入微软网络后即断；而同一台机器访问 Azure Static Web App
+（`20.247.40.92`）和 `management.azure.com` 都正常。
+
+因为 check-host 的多个境外节点都能正常打开，**这不是部署问题，是这台机器的网络路径
+对那个 IP 的问题**。可能需要在别的网络（手机热点）打开，或者改用镜像方案。
+
+`status_app.py --selftest` 可以在不联网、不需要任何云资源的条件下验证渲染路径
+（含降级路径），改动页面后先跑它：
+
+```bash
+podman run --rm --entrypoint python <image> /app/status_app.py --selftest
+```
 
 ## 11. 工作流侧的三处改动
 

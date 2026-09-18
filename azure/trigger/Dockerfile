@@ -25,18 +25,23 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-COPY azure/trigger/trigger.py /app/trigger.py
+COPY azure/trigger/trigger.py    /app/trigger.py
+COPY azure/trigger/status_app.py /app/status_app.py
 
+# Two entry points in one image: trigger.py is what the scheduled job runs,
+# status_app.py is what the status container app serves (via --command). Sharing
+# an image means only one ghcr package has to be public.
+#
 # Non-root on purpose, unlike the pipeline image (which runs as root because it
 # bind-mounts a host output directory). Nothing here needs to write to disk,
-# and this process holds a credential with write access to the repository.
+# and trigger.py holds a credential with write access to the repository.
 #
 # The chmod is load-bearing, not tidiness. COPY preserves the source file's
 # mode, and a checkout with a restrictive umask (0600) lands as root:root 0600
 # — unreadable by uid 10001, which fails at runtime with a bare
 # "can't open file '/app/trigger.py': [Errno 13] Permission denied".
 RUN useradd --uid 10001 --create-home trigger \
- && chmod 0644 /app/trigger.py
+ && chmod 0644 /app/trigger.py /app/status_app.py
 USER 10001
 
 ENTRYPOINT ["python", "/app/trigger.py"]
