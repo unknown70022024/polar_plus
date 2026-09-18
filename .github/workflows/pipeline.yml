@@ -68,9 +68,24 @@ jobs:
             exit "$rc"
           fi
 
+          # Exit 0 with no manifest would mean run.py staged nothing, and the
+          # upload below would then publish a stale or absent tree. Check it
+          # here so the failure names the actual problem — mirrors the same
+          # guard in azure/entrypoint.sh.
+          if [ ! -f output/latest/root.json ]; then
+            echo "::error::run.py exited 0 but staged no output/latest/root.json"
+            exit 1
+          fi
+
           TS=$(python -c "import json; print(json.load(open('output/latest/root.json'))['timestamp'])")
           echo "GCC_TIMESTAMP=$TS" >> "$GITHUB_ENV"
           echo "published=true" >> "$GITHUB_OUTPUT"
+        env:
+          # Not optional. Without OUTPUT_DIR the pipeline falls back to
+          # polar_plus/output, and the manifest check above then fails on a
+          # successful run — the whole workflow breaks while looking healthy.
+          OUTPUT_DIR: ${{ github.workspace }}/output
+          GH_PAGES_BASE: ${{ vars.GH_PAGES_BASE }}
 
       # Everything below only means anything if the pipeline actually staged a
       # new tree. Gating on the flag keeps `output/latest` from being uploaded
