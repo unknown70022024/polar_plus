@@ -1,7 +1,26 @@
 # 定时触发的拆分：Azure 管时钟，GitHub 管算力
 
-> 状态：代码与 Azure 侧配置已就位；**包可见性待改**（见第 6 节）。
+> 状态：代码、Azure 侧配置与工作流均已就位并**端到端验证通过**；仅**包可见性**待手动改一次（见第 6 节）。
 > `azure/OPERATIONS.md` 描述的是拆分之前的架构，仍然准确，但不再是当前形态。
+
+## 0. 验证记录
+
+全链路实跑，不是推断：
+
+| 环节 | 结果 |
+|---|---|
+| Azure 手动执行 `polar-trigger` | Succeeded，23 s（含冷启动拉 132 MB 镜像）|
+| 容器内派发 | `POST ... dispatches` → **HTTP 204，1.450 s** |
+| 对应 GitHub run | #557，`pipeline` + `deploy` **全部 success** |
+| 线上 `root.json` | `timestamp: 20260918_060000`，`version: 84629b87a2f5` |
+| 产物可达 | px/py/nz.jpg、storms.json（52 KB）、aurora.json 均 HTTP 200 |
+
+`version` 是新 commit 的 sha 前 12 位——版本标记机制按设计工作。
+
+**过程中由这次真实运行抓出一个我引入的 bug**：重写工作流步骤时漏了 `env: OUTPUT_DIR`，
+输出落到 `polar_plus/output/` 而后续读 `output/latest/root.json`，于是 run.py 明明成功、
+发布也写完了，却在最后一行 `FileNotFoundError` 退出 1（run #556）。整条工作流看似在跑，
+实际全废。已修复并补了显式检查。**这个 bug 靠读代码没看出来。**
 
 ## 1. 为什么改
 
@@ -151,9 +170,34 @@ curl -s -H "Authorization: Bearer $T" \
 
 > 裸请求 manifest 返回 **401 是正常的**（OCI 认证挑战），不代表镜像是 private。
 
-**为什么不用 registry 凭据绕过**：那样任务就永久依赖一个具备 `read:packages` 的 token。
+**为什么不用 registry 凭据长期绕过**：那样任务就永久依赖一个具备 `read:packages` 的 token。
 而 fine-grained PAT 是按仓库授权的，**拿不到 ghcr 包权限**——等于强迫这个 token 永远做 classic。
 改成 public 之后，派发用的 token 才能收缩成"只授权 polar_plus、只给 `Actions: write`"。
+
+### 当前状态：临时用了 registry 凭据
+
+`polar-trigger` 是**带着 registry 凭据**建起来的，因为 Azure 在创建时就校验拉取，
+私有镜像根本建不出任务。这不增加任何暴露面——凭据复用的就是派发用的那同一个 secret
+`gh-dispatch-token`，本来就存在这个任务里。
+
+改成 public 之后**要把这个凭据摘掉**，否则轮换 token 时还得额外维护它，而且新 token
+必须是 classic：
+
+```bash
+# 确认包已是 public（匿名 token 长度约 68，private 为 0）
+T=$(curl -s "https://ghcr.io/token?scope=repository:unknown70022024/polar-plus-trigger:pull&service=ghcr.io" \
+    | python3 -c "import sys,json;print(json.load(sys.stdin).get('token',''))")
+echo "匿名 token 长度: ${#T}"
+
+# 摘掉 registry 凭据（secret 保留，派发还要用）
+az containerapp job registry remove -n polar-trigger -g polar-plus-rg --server ghcr.io
+
+# 验证：现在应当匿名拉取，任务仍能正常执行
+az containerapp job registry list -n polar-trigger -g polar-plus-rg -o table
+az containerapp job start -n polar-trigger -g polar-plus-rg
+```
+
+`secrets` 里仍然只有 `gh-dispatch-token` 一个——registry 凭据引用的是它，没有第二个密钥。
 
 ## 7. 创建触发任务
 
