@@ -34,20 +34,24 @@ import numpy as np
 
 from polar_plus.config import (GCC_V2A_BASE, BT_WARM, BT_COLD, SEARCH_HOURS,
                                MIN_AGE_HOURS, HEALTH_ENFORCE,
-                               HEALTH_DEAD_BLOCKS_MAX,
-                               GCC_SIZE_FILTER_RATIO)
-from polar_plus.health import BtHealth, count_dead_blocks, evaluate_bt
+                               GCC_SIZE_FILTER_RATIO, HEALTH_FILL_LAT,
+                               HEALTH_UNFILLABLE_MAX_PCT,
+                               BT_N_ROWS, BT_N_COLS, BT_N_BANDS)
+from polar_plus.health import BtHealthAccumulator
 
 logger = logging.getLogger(__name__)
 
 # BT_10.8um geometry: (1, 6480, 12960) uint16, chunks (1, 1620, 3240).
 # One 1620-row band costs exactly 4 HDF5 chunks (the 4 longitude quadrants),
 # so a band is the cheapest unit that still spans every longitude. The
-# north band (lat 90..45N) is read first because every incomplete file we
-# have measured is missing high-latitude data first.
-BT_ROWS = 6480
-BT_COLS = 12960
-BT_BANDS = 4
+# north band (lat 90..45N) is read first.
+#
+# The values come from config so that health.py — which needs the row count to
+# build latitude weights and cannot import this module — reads the same
+# numbers rather than a second copy of them.
+BT_ROWS = BT_N_ROWS
+BT_COLS = BT_N_COLS
+BT_BANDS = BT_N_BANDS
 BT_BAND_ROWS = BT_ROWS // BT_BANDS      # 1620 == one HDF5 chunk row
 
 
@@ -138,13 +142,15 @@ def _read_bt_banded(h, enforce: bool = True) -> tuple:
 
     Why banded: BT_10.8um is chunked (1, 1620, 3240), so one 1620-row band
     costs exactly 4 HDF5 chunks. Reading a band at a time lets us detect a
-    still-being-written file after 4 of the 16 chunks instead of all 16 —
-    and on a healthy file it costs exactly the same as reading the whole
-    variable in one go, because the chunk set is identical.
+    file that has already failed the gate after 4 of the 16 chunks instead of
+    all 16 — and on a file that passes it costs exactly the same as reading
+    the whole variable in one go, because the chunk set is identical.
 
-    The north band (lat 90..45N) is read first: every incomplete file we have
-    measured loses high-latitude data first, so that ordering maximises the
-    early-abort saving.
+    The gate itself is an area measurement, not a count: see
+    ``BtHealthAccumulator`` and the "completeness gate" section of config.py.
+    The running total is monotone, so aborting on the partial value is sound.
+    A fully empty file is still caught in band 0 — the unfillable rows of that
+    band alone are 7.95% of the globe, far past the 1.05% line.
 
     Args:
         h: an open h5py.File for the remote file (shared with the caller so
@@ -155,37 +161,41 @@ def _read_bt_banded(h, enforce: bool = True) -> tuple:
         (bt_float32_with_nan, health)
 
     Raises:
-        IncompleteGCCError: when the accumulated dead-block count crosses
-            HEALTH_DEAD_BLOCKS_MAX and ``enforce`` is True. The caller never
-            reaches the cloud_phase read in that case.
+        IncompleteGCCError: when the accumulated unfillable loss has crossed
+            the threshold and ``enforce`` is True. The caller never reaches
+            the cloud_phase read in that case.
     """
     t0 = time.time()
     bt = np.empty((BT_ROWS, BT_COLS), dtype=np.float32)
-    dead_total = 0
+    acc = BtHealthAccumulator()
     for band in range(BT_BANDS):
         r0 = band * BT_BAND_ROWS
         raw = h['BT_10.8um'][0, r0:r0 + BT_BAND_ROWS, :]
         invalid = (raw == 65535) | (raw < 18000) | (raw > 40000)
-        # Per-band contribution to the dead-block tally; the running total is
-        # monotone, so it is safe to abort on the partial value.
-        dead_band, worst = count_dead_blocks(invalid)
-        dead_total += dead_band
+        acc.add_band(invalid, r0)
         part = raw.astype(np.float32) * 0.01
         part[invalid] = np.nan
         bt[r0:r0 + BT_BAND_ROWS] = part
         del raw, part
+        lat_hi = 90 - band * 45
+        lat_lo = 90 - (band + 1) * 45
         logger.info(
-            f"    BT band {band} (lat {90 - band * 45}..{90 - (band + 1) * 45}): "
-            f"无效率 {invalid.mean() * 100:5.1f}%, 死块 {dead_band:4d}, "
-            f"累计 {dead_total}")
-        if enforce and dead_total >= HEALTH_DEAD_BLOCKS_MAX:
+            f"    BT band {band} (lat {lat_hi}..{lat_lo}): "
+            f"无效率 {invalid.mean() * 100:5.1f}%, "
+            f"不可补 {acc.unfillable_pct:6.3f}% (上限 "
+            f"{HEALTH_UNFILLABLE_MAX_PCT}%), "
+            f"可补 {acc.fillable_pct:6.3f}% "
+            f"| 诊断 死块 {acc.dead_blocks} 最差块 "
+            f"{acc.worst_block * 100:.0f}%")
+        if enforce and acc.exceeded:
             raise IncompleteGCCError(
-                f"BT_10.8um 在第 {band} 带（lat "
-                f"{90 - band * 45}..{90 - (band + 1) * 45}）即累计 "
-                f"{dead_total} 个死块，判定文件未写完"
-                f"（已读 {(band + 1) * 4}/16 chunk）")
+                f"BT_10.8um 在第 {band} 带（lat {lat_hi}..{lat_lo}）"
+                f"累计不可补缺失 {acc.unfillable_pct:.3f}%，已超过上限 "
+                f"{HEALTH_UNFILLABLE_MAX_PCT}%，判定文件不可用"
+                f"（SSEC 只能补 |lat|>{HEALTH_FILL_LAT:.0f} 的部分，"
+                f"已读 {(band + 1) * 4}/16 chunk）")
 
-    health = evaluate_bt(np.isnan(bt))
+    health = acc.finalize()
     logger.info(f"    BT_10.8um 读毕 {bt.shape} in {time.time() - t0:.0f}s, "
                 f"BT {np.nanmin(bt):.1f}~{np.nanmax(bt):.1f}K, "
                 f"{health.summary()}")

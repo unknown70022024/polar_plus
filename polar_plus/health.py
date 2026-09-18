@@ -24,23 +24,49 @@ The signal
 grid of chunks, each 45 deg of latitude by 90 deg of longitude. Missing data
 is ``_FillValue`` (65535) or outside ``valid_range`` [18000, 40000].
 
-We split the field into 405x810 sub-blocks (256 of them) and count how many
-are at least 95% invalid. Measured on real files, 2026-09-15:
+The verdict is the **area-weighted invalid fraction over the region SSEC
+cannot repair** (|lat| < 60): reject when it exceeds
+``HEALTH_UNFILLABLE_MAX_PCT`` (1.05%).
 
-    file                    global invalid   dead_blocks   verdict
-    09-14 14:00 (reproc.)       1.3%              0        usable
-    09-15 09:00                 8.2%              1        usable
-    09-15 10:00                 8.2%              1        usable
-    09-15 11:00                 5.6%              1        usable
-    09-15 12:00                 5.3%              1        usable
-    09-15 13:00                 5.3%              1        usable
-    09-15 14:00 (writing)      33.2%             43        REJECT
+    unfillable_pct = Σ over rows with |lat| < 60 of
+                     (row invalid fraction × row area share) × 100
 
-Healthy files sit at 0-1 dead blocks (the 1 is one fixed high-latitude gap
-present in every file) and still-writing ones at 43, so the threshold in
-HEALTH_DEAD_BLOCKS_MAX keeps a wide margin on both sides. The separate
-global-invalid backstop catches a file that is uniformly sparse without any
-single dead block.
+Rows are weighted by their exact spherical area, ``sin(hi) - sin(lo)``, not by
+the midpoint approximation. There is deliberately **no cap** on loss inside
+|lat| > 60, because capfill repaints that region from SSEC.
+
+What this replaced, and why
+---------------------------
+Until 2026-09-18 the gate counted 405x810 sub-blocks that were >=95% invalid
+and rejected at 4 of them. Measured over 45 real files (full sweep in the
+gcc-probe repository) that count was wrong in both directions simultaneously:
+
+  * **count != area.** A block is a fixed pixel count, so it covers 0.060% of
+    the globe at the pole and 0.610% at the equator — 10.2x. "Four dead
+    blocks" meant 0.24% of the globe at high latitude but 2.44% near it.
+  * **>=95% is a cliff.** 94% invalid contributed nothing, 95% contributed a
+    whole unit, so the verdict tracked the *shape* of the damage rather than
+    its size. 09-17 16:00Z measured 47.6% invalid across the whole 70-80N band
+    yet scored zero dead blocks, and was published with black holes over the
+    equatorial faces — the exact defect the gate exists to prevent.
+  * **position was ignored.** Loss inside capfill's |lat| > 60 zone is
+    recoverable, loss outside is not, and the count treated them alike.
+
+The result was that accept/reject was not even monotone in data loss: a file
+missing 5.69% of the globe was accepted while one missing 3.87% was rejected,
+and files whose only defect was a fixable polar cap were thrown away.
+
+Measured separation after the change, same 45 files:
+
+    accepted, worst   0.760% unfillable
+    rejected, best    1.037% unfillable
+
+Nothing sat near 1.0%, so the threshold inside that gap changes no observed
+decision; 1.05% takes the loose end and admits the 1.037% file.
+
+The dead-block count survives as a **diagnostic only** (see
+``count_dead_blocks``): it no longer decides anything, but it appears in years
+of logs and comparing it across the change is how the transition is reviewed.
 
 Everything in this module is defensive: it is called before any download has
 happened, it runs on every pipeline invocation including the very first one,
@@ -59,13 +85,15 @@ from datetime import datetime, timedelta, timezone
 
 import numpy as np
 
-from polar_plus.config import (DEV_VERSION, FLOOR_TS_ENV,
-                               HEALTH_DEAD_BLOCKS_MAX,
-                               HEALTH_DEAD_SUBBLOCK_FRAC,
-                               HEALTH_GLOBAL_INVALID_MAX, HEALTH_SUB_COLS,
-                               HEALTH_SUB_ROWS, LEGACY_MARKER_KEY, OUTPUT_DIR,
-                               ROOT_TS_TIMEOUT, ROOT_VERSION_KEY, VERSION_ENV,
-                               pipeline_version, public_base_url)
+from functools import lru_cache
+
+from polar_plus.config import (BT_N_ROWS, DEV_VERSION, FLOOR_TS_ENV,
+                               HEALTH_DEAD_SUBBLOCK_FRAC, HEALTH_FILL_LAT,
+                               HEALTH_SUB_COLS, HEALTH_SUB_ROWS,
+                               HEALTH_UNFILLABLE_MAX_PCT, LEGACY_MARKER_KEY,
+                               OUTPUT_DIR, ROOT_TS_TIMEOUT, ROOT_VERSION_KEY,
+                               VERSION_ENV, pipeline_version,
+                               public_base_url)
 
 logger = logging.getLogger(__name__)
 
@@ -82,27 +110,168 @@ _TS_RE = re.compile(r"^(\d{8})_(\d{4}|\d{6})$")
 # ---------------------------------------------------------------------------
 # BT_10.8um completeness
 # ---------------------------------------------------------------------------
+# The verdict is an AREA measurement over the region SSEC cannot repair. See
+# the "BT_10.8um completeness gate" section of config.py for why the previous
+# dead-block *count* was replaced — briefly, count is not area (10.2x spread
+# between a polar and an equatorial block), the 95% rule is a cliff that made
+# the verdict depend on the shape of the damage rather than its size, and it
+# ignored whether the loss fell inside capfill's |lat| > 60 zone.
 
 @dataclass(frozen=True)
 class BtHealth:
-    """Verdict for one candidate file's BT_10.8um coverage."""
+    """Verdict for one candidate file's BT_10.8um coverage.
+
+    ``unfillable_pct`` is the decisive figure: the area-weighted invalid
+    fraction, in percent of the globe, over |lat| <= HEALTH_FILL_LAT (the part
+    SSEC cannot patch). ``fillable_pct`` is the same measure over the polar
+    caps, reported but never used to decide. Dead blocks are kept as
+    diagnostics for continuity with the historical log record.
+    """
 
     global_invalid: float     # fraction of the whole grid that is fill/invalid
     dead_blocks: int          # 16x16 sub-blocks at/above the dead threshold
     worst_block: float        # invalid fraction of the worst single sub-block
     ok: bool
     reason: str = ""
+    unfillable_pct: float = 0.0
+    fillable_pct: float = 0.0
 
     def summary(self) -> str:
-        return (f"global_invalid={self.global_invalid * 100:.1f}% "
-                f"dead_blocks={self.dead_blocks} "
-                f"worst_block={self.worst_block * 100:.1f}%")
+        return (f"不可补缺失={self.unfillable_pct:.3f}% "
+                f"(上限 {HEALTH_UNFILLABLE_MAX_PCT}%) "
+                f"可补缺失={self.fillable_pct:.3f}% "
+                f"| 诊断: 全局无效={self.global_invalid * 100:.1f}% "
+                f"死块={self.dead_blocks} 最差块={self.worst_block * 100:.1f}%")
+
+
+@lru_cache(maxsize=4)
+def row_area_weights(n_rows: int) -> tuple:
+    """Exact spherical area of each row, as a fraction of the globe summing to 1.
+
+    Uses the exact band area ``sin(lat_hi) - sin(lat_lo)`` per row.
+
+    The more obvious ``cos(lat_centre)`` midpoint form is *not* used, but the
+    honest reason is robustness rather than a bug: measured on this 6480-row
+    grid the two agree to machine precision (largest relative difference
+    0.000% across every row, and identical band totals), because a midpoint
+    quadrature of cos over a 0.028-degree cell is already exact to well below
+    float64 display precision. The exact form is kept because it is right by
+    construction at any resolution — a coarser grid, or a future change to
+    BT_N_ROWS, would start to separate them, and nothing here should depend on
+    the grid staying this fine.
+    """
+    edges = np.linspace(90.0, -90.0, n_rows + 1)
+    w = np.sin(np.deg2rad(edges[:-1])) - np.sin(np.deg2rad(edges[1:]))
+    return tuple((w / w.sum()).tolist())
+
+
+def row_centres(n_rows: int) -> np.ndarray:
+    """Latitude of each row's centre, north to south."""
+    edges = np.linspace(90.0, -90.0, n_rows + 1)
+    return (edges[:-1] + edges[1:]) / 2.0
+
+
+def unfillable_row_mask(n_rows: int = None,
+                        fill_lat: float = None) -> np.ndarray:
+    """Boolean mask of rows SSEC cannot repair (``|lat| < fill_lat``).
+
+    Strict on both sides. For the real 6480-row grid no cell centre lands
+    exactly on +/-60, so the boundary convention cannot change a verdict; a
+    test pins that, because it stops being true if the grid ever changes.
+    """
+    n_rows = n_rows or BT_N_ROWS
+    fill_lat = HEALTH_FILL_LAT if fill_lat is None else fill_lat
+    c = row_centres(n_rows)
+    return (c > -fill_lat) & (c < fill_lat)
+
+
+class BtHealthAccumulator:
+    """Running unfillable-area tally, fed one latitude band at a time.
+
+    Exists so the banded reader can reach a verdict without a second pass over
+    a full 6480x12960 mask. Everything is accumulated from per-band
+    ``invalid.mean(axis=1)`` plus the row weights, so memory stays at one band
+    (about 21 MB of bool) instead of a full float64 intermediate (~670 MB).
+
+    The diagnostic dead-block count accumulates the same way. That is exact,
+    not an approximation: the sub-block size is fixed at 405x810, so a band's
+    4x16 grid contributes precisely its rows of the full 16x16 grid, and the
+    totals agree — the gcc-probe sweep verified ``band_sum == full_count`` on
+    all 45 measured files.
+    """
+
+    def __init__(self, n_rows: int = None, fill_lat: float = None):
+        self.n_rows = n_rows or BT_N_ROWS
+        self._w = np.asarray(row_area_weights(self.n_rows))
+        self._mid = unfillable_row_mask(self.n_rows, fill_lat)
+        self.unfillable_pct = 0.0
+        self.fillable_pct = 0.0
+        self.dead_blocks = 0
+        self.worst_block = 0.0
+        self._invalid_px = 0
+        self._total_px = 0
+        self._rows_seen = 0
+
+    def add_band(self, invalid_band: np.ndarray, row0: int) -> None:
+        """Fold one band's invalid mask in. ``row0`` is its first row index."""
+        n = invalid_band.shape[0]
+        if row0 != self._rows_seen:
+            raise ValueError(
+                f"bands must be added in order and without gaps: got row0="
+                f"{row0}, expected {self._rows_seen}")
+        w = self._w[row0:row0 + n]
+        # Contribution of each row to the global invalid area, in percent.
+        contrib = invalid_band.mean(axis=1) * w * 100.0
+        mid = self._mid[row0:row0 + n]
+        self.unfillable_pct += float(contrib[mid].sum())
+        self.fillable_pct += float(contrib[~mid].sum())
+
+        dead, worst = count_dead_blocks(invalid_band)
+        self.dead_blocks += dead
+        self.worst_block = max(self.worst_block, worst)
+
+        self._invalid_px += int(invalid_band.sum())
+        self._total_px += int(invalid_band.size)
+        self._rows_seen += n
+
+    @property
+    def exceeded(self) -> bool:
+        """True once the running unfillable loss has already failed the gate.
+
+        Monotone, so it is safe to abort on the partial sum — the same
+        property the old cumulative dead-block count relied on.
+        """
+        return self.unfillable_pct > HEALTH_UNFILLABLE_MAX_PCT
+
+    @property
+    def global_invalid(self) -> float:
+        return (self._invalid_px / self._total_px) if self._total_px else 0.0
+
+    def finalize(self) -> "BtHealth":
+        """Verdict for everything accumulated so far."""
+        reasons = []
+        if self.unfillable_pct > HEALTH_UNFILLABLE_MAX_PCT:
+            reasons.append(f"不可补缺失={self.unfillable_pct:.3f}%>"
+                           f"{HEALTH_UNFILLABLE_MAX_PCT}%")
+        return BtHealth(
+            global_invalid=self.global_invalid,
+            dead_blocks=self.dead_blocks,
+            worst_block=self.worst_block,
+            unfillable_pct=self.unfillable_pct,
+            fillable_pct=self.fillable_pct,
+            ok=not reasons,
+            reason=", ".join(reasons),
+        )
 
 
 def count_dead_blocks(invalid: np.ndarray,
                       sub_rows: int = None,
                       sub_cols: int = None) -> tuple[int, float]:
     """Count sub-blocks whose invalid fraction is at/above the dead threshold.
+
+    DIAGNOSTIC ONLY — this no longer decides anything. It is kept because the
+    number appears in years of logs and comparing it across the change is how
+    the transition gets reviewed.
 
     The sub-block geometry is fixed (HEALTH_SUB_ROWS x HEALTH_SUB_COLS, i.e.
     405x810 = 1/16 of a latitude band by 1/4 of a chunk width), **not** a
@@ -140,23 +309,22 @@ def count_dead_blocks(invalid: np.ndarray,
 
 
 def evaluate_bt(invalid: np.ndarray) -> BtHealth:
-    """Full verdict from an invalid-mask for BT_10.8um.
+    """Full verdict from a complete invalid mask for BT_10.8um.
 
-    ``ok`` is driven by the dead-block count, which is the measured
-    discriminator. The global-invalid threshold is a loose backstop only —
-    a still-writing file measured 33% global (below the 50% backstop) yet
-    thousands of dead blocks, so the backstop is not what does the work.
+    A thin wrapper over BtHealthAccumulator with a single band, so the
+    streaming path in gcc_load and this whole-array path cannot drift apart —
+    they are literally the same arithmetic.
+
+    The old global-invalid backstop (50%) is gone: it is subsumed. A file that
+    is entirely fill has an unfillable loss of 86.6% of the globe, because
+    |lat| <= 60 covers that much of the sphere, so the area criterion rejects
+    it with room to spare. Keeping two thresholds would only invite the
+    "which one actually decides?" confusion the old SEARCH_HOURS /
+    MAX_FALLBACK_HOURS pair caused.
     """
-    dead, worst = count_dead_blocks(invalid)
-    glob = float(invalid.mean())
-    reasons = []
-    if dead >= HEALTH_DEAD_BLOCKS_MAX:
-        reasons.append(f"dead_blocks={dead}>={HEALTH_DEAD_BLOCKS_MAX}")
-    if glob >= HEALTH_GLOBAL_INVALID_MAX:
-        reasons.append(
-            f"global_invalid={glob:.1%}>={HEALTH_GLOBAL_INVALID_MAX:.0%}")
-    return BtHealth(global_invalid=glob, dead_blocks=dead, worst_block=worst,
-                    ok=not reasons, reason=", ".join(reasons))
+    acc = BtHealthAccumulator(n_rows=invalid.shape[0])
+    acc.add_band(invalid, 0)
+    return acc.finalize()
 
 
 # ---------------------------------------------------------------------------

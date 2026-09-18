@@ -95,6 +95,26 @@ BT_COLD = 200.0       # Kelvin — below this → thick cloud (density=255)
 MIN_AGE_HOURS = 2     # Skip files younger than this (still being assembled)
 
 # ---------------------------------------------------------------------------
+# BT_10.8um native geometry — single source of truth
+# ---------------------------------------------------------------------------
+# health.py needs the row count to build latitude weights, and it must not
+# import gcc_load (gcc_load imports health). Keeping the numbers here is what
+# lets the gate be described without a circular import, and it removes the
+# duplicated literals that used to live in gcc_load as well.
+BT_N_ROWS = 6480          # 90N..90S at 1/36 degree (3 km at the equator)
+BT_N_COLS = 12960
+BT_N_BANDS = 4            # read/validated one band at a time
+BT_CHUNK_ROWS = 1620      # == BT_N_ROWS / BT_N_BANDS == one HDF5 chunk row
+BT_CHUNK_COLS = 3240      # 4 chunks span a row of the array
+
+# The latitude where SSEC gap-fill stops being possible — |lat| > this is
+# repairable from SSEC, |lat| < this is not. It is one boundary serving two
+# consumers (capfill decides where to paint; the gate decides which loss is
+# forgivable), so it lives here rather than inside either of them. Written by
+# hand ONCE; HEALTH_FILL_LAT below derives from it.
+GAP_LAT_THRESHOLD = 60.0
+
+# ---------------------------------------------------------------------------
 # BT_10.8um completeness gate
 # ---------------------------------------------------------------------------
 # The GCC NetCDF files carry ~37 science variables and NASA keeps appending
@@ -103,34 +123,66 @@ MIN_AGE_HOURS = 2     # Skip files younger than this (still being assembled)
 # the one variable this pipeline needs — BT_10.8um — is actually complete.
 # We therefore validate BT_10.8um itself, band by band, while reading it.
 #
-# Measured on real files (BT_10.8um, invalid = _FillValue or outside
-# valid_range), 2026-09-15, sub-blocks of 405x810 (405 = 6480/16 rows,
-# 810 = 3240/4 cols), out of 256 blocks total:
+# THE DECISION IS AREA-BASED, NOT COUNT-BASED
+# -------------------------------------------
+# The criterion is: the area-weighted invalid fraction over the region SSEC
+# cannot fill must not exceed HEALTH_UNFILLABLE_MAX_PCT.
 #
-#     file                       band invalid N->S      dead_blocks   verdict
-#     09-14 14:00 (reprocessed)  ~1%                     0            usable
-#     09-15 09:00 .. 13:00       5-8%                    1            usable
-#     09-15 14:00 (12h later)    24/12/8/31%             7            REJECT
-#     09-15 15:00                63% in band 0 alone    30 (band 0)  REJECT
-#     09-15 14:00 (mid-write)    --                      43           REJECT
+# It replaced a count of "dead" 405x810 blocks (>=95% invalid, reject at 4).
+# That count was wrong in both directions at once, measured over 45 real files
+# on 2026-09-18 (see the gcc-probe repository for the full sweep):
 #
-# Healthy files sit at 0-1 dead blocks (the 1 is one fixed high-latitude gap
-# that appears in every file). The 14:00 and 15:00 rows above are not merely
-# "less good" — they are files NASA never finished writing, and they stayed
-# that way hours later. 15:00 is the one a scheduled run actually published
-# before this gate existed: the resulting tiles were 67-94% pure black on
-# every equatorial face, and the app served that for hours.
+#   * **Count is not area.** The block grid is fixed in pixels, so one block
+#     covers 0.060% of the globe at the pole and 0.610% at the equator — a
+#     10.2x spread. "Four dead blocks" therefore meant 0.24% of the globe at
+#     high latitude but 2.44% near the equator.
+#   * **The 95% rule is a cliff.** A block that is 94% invalid contributes
+#     nothing while one at 95% contributes a whole unit, so the verdict
+#     depended on the *shape* of the damage rather than its size. 09-17 16:00Z
+#     was 47.6% invalid across the whole 70-80N band and scored ZERO dead
+#     blocks, so it was published with black holes in the equatorial faces —
+#     exactly the defect this gate exists to prevent.
+#   * **It ignored where the damage was.** capfill repairs |lat| > 60 from
+#     SSEC, so loss there is recoverable and loss elsewhere is not. The old
+#     criterion treated both identically and rejected files whose only defect
+#     was a polar cap that SSEC was about to patch.
 #
-# The threshold is 4: four times the worst healthy file observed, and well
-# below both damaged ones. Erring strict is deliberate. A false reject only
-# means "keep serving the previous good data"; a false accept publishes
-# garbage that stays live until some later run happens to succeed.
+# The measured consequence was that the accept/reject decisions were not even
+# monotone in actual data loss: a file missing 5.69% of the globe was accepted
+# while one missing 3.87% was rejected. And it was dominated on every axis —
+# publishing on 15 of 23 simulated runs versus 19, with a worst published loss
+# of 3.09% versus 0.76%.
+#
+# Measured separation on that same sweep:
+#
+#     accepted, worst      0.760%   unfillable loss
+#     rejected, best       1.037%   unfillable loss
+#
+# No file sat near 1.0%, so the exact threshold in that gap does not change any
+# observed decision. 1.05% is chosen — deliberately the loose end of the gap,
+# and loose enough to admit the 1.037% file. The comparison is strict `>`, so
+# a file at exactly 1.05% is accepted.
+#
+# There is NO cap on the SSEC-fillable (|lat| > 60) loss. A file may have a
+# large polar cap coming from SSEC; that trade is accepted deliberately, and
+# is what makes more runs publish at all. Note the absolute size of the line:
+# 1.05% of the globe is ~5.4 million km^2.
+HEALTH_UNFILLABLE_MAX_PCT = 1.05
+
+# Where SSEC gap-fill stops being possible. Derived from GAP_LAT_THRESHOLD
+# rather than written as a second literal 60: if that is ever changed, a
+# duplicate here would silently make the gate disagree with capfill about
+# which loss is recoverable.
+HEALTH_FILL_LAT = GAP_LAT_THRESHOLD
+
+# Diagnostic only — reported in the log so a run can be compared against the
+# historical record, but NOT consulted when deciding. Kept because the numbers
+# are free (same invalid mask) and because comparing them across the change is
+# how the transition is reviewed.
 HEALTH_SUB_ROWS = 405           # 6480 / 16
 HEALTH_SUB_COLS = 810           # 3240 / 4
 HEALTH_DEAD_SUBBLOCK_FRAC = 0.95  # sub-block at/above this → "dead"
-HEALTH_DEAD_BLOCKS_MAX = 4      # >= this many dead blocks → file incomplete
-HEALTH_GLOBAL_INVALID_MAX = 0.50  # separate backstop: catches a uniformly
-                                  # sparse file that has no single dead block
+
 # (There used to be a stability probe here — _wait_stable, which slept for a
 # few seconds and compared two HEAD signatures before reading, to avoid reading
 # a file NASA was still rewriting. It was removed: the correctness guarantee
@@ -375,7 +427,9 @@ SSEC_WMS_URL = ("https://realearth.ssec.wisc.edu/cgi-bin/mapserv"
 
 SSEC_API_BASE = "http://re.ssec.wisc.edu/api/image"
 
-GAP_LAT_THRESHOLD = 60.0    # |lat| > threshold → allow SSEC gap-fill
+# GAP_LAT_THRESHOLD is defined near the top of this file, next to the
+# completeness gate, because it is the boundary between "recoverable" and
+# "not recoverable" for BOTH consumers. See the note there.
 FEATHER_WIDTH = 2.0         # degrees — cosine fade-in at the 60° cut-off
 
 # A pixel counts as a hole when its density is below the value that
