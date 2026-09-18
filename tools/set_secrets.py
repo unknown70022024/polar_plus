@@ -4,7 +4,8 @@
 用法：
     python tools/set_secrets.py [owner/repo]
 
-需要 ~/.gh-token（一个含 repo + workflow scope 的 PAT）。
+需要 GitHub 凭据（见 tools/credentials.py；当前在 ~/keys/github_pat，
+权限 400），scope 要含 Secrets 写权限。
 密钥值从不打印，只报长度。
 """
 import base64
@@ -16,6 +17,9 @@ import urllib.request
 
 from nacl.encoding import Base64Encoder
 from nacl.public import PublicKey, SealedBox
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from credentials import load_token   # noqa: E402
 
 API = "https://api.github.com"
 REPO = sys.argv[1] if len(sys.argv) > 1 else "unknown70022024/lightning-pipeline"
@@ -40,7 +44,7 @@ def load_env() -> dict[str, str]:
 
 
 def main() -> int:
-    token = pathlib.Path.home().joinpath(".gh-token").read_text().strip()
+    token = load_token()
     values = load_env()
     missing = [k for k in WANTED if k not in values]
     if missing:

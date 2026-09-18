@@ -9,3 +9,8 @@ rewrite/
 
 # 本地临时脚本
 tbash
+
+# 本地凭据兜底规则：凭据应当放在仓库外（如 ~/keys/），
+# 但万一有人把 token 落到仓库目录里，这几条能挡住 git add -A
+github_pat
+*_pat

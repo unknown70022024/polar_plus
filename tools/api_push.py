@@ -23,10 +23,15 @@ import sys
 import urllib.error
 import urllib.request
 
-TOKEN = pathlib.Path.home().joinpath(".gh-token").read_text().strip()
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from credentials import describe, load_token   # noqa: E402
+
+TOKEN = load_token()
 REPO = sys.argv[1] if len(sys.argv) > 1 else "unknown70022024/polar_plus"
 BRANCH = sys.argv[2] if len(sys.argv) > 2 else "main"
 API = "https://api.github.com"
+
+print(f"凭据: {describe()}")
 
 MAP_PATH = subprocess.run(["git", "rev-parse", "--git-dir"],
                           capture_output=True, text=True,
@@ -70,9 +75,56 @@ def save_map(m):
     MAP_FILE.write_text(json.dumps(m, indent=1, sort_keys=True))
 
 
+def repo_default_branch():
+    """仓库的默认分支名，读不到就退回 BRANCH。"""
+    try:
+        return api("GET", "/repos/%s" % REPO, quiet=True).get("default_branch") or BRANCH
+    except urllib.error.HTTPError:
+        return BRANCH
+
+
+def ensure_commits_exist():
+    """空仓库上 Git Data API 全部返回 409，先用 Contents API 造一个根提交。
+
+    GitHub 不允许在**一个提交都没有**的仓库上创建 blob / tree / commit
+    对象（`/git/blobs`、`/git/trees`、`/git/commits` 都是 409
+    "Git Repository is empty"）。但 Contents API 可以，它会顺带把默认分支
+    建出来。占位文件随后会被真实的第一棵树覆盖——那棵树里没有这个文件，
+    所以最终内容不受影响，占位只留在历史里。
+
+    这个坑在 polar_plus 上踩过一次（当时是手工先建了初始提交），所以这里
+    做成幂等的：已经有提交就直接返回。
+    """
+    try:
+        api("GET", "/repos/%s/git/ref/heads/%s" % (REPO, BRANCH), quiet=True)
+        return False
+    except urllib.error.HTTPError as exc:
+        if exc.code not in (404, 409):
+            raise
+
+    default = repo_default_branch()
+    api("PUT", "/repos/%s/contents/.bootstrap" % REPO, {
+        "message": "chore: 初始化空仓库（Git Data API 在空仓库上返回 409）",
+        "content": base64.b64encode(b"placeholder\n").decode(),
+        "branch": default,
+    })
+    print("  空仓库：已用 Contents API 创建根提交（默认分支 %s）" % default)
+
+    if default != BRANCH:
+        # 请求的分支和默认分支不同名，把默认分支的根提交也指到 BRANCH 上。
+        sha = api("GET", "/repos/%s/git/ref/heads/%s" % (REPO, default),
+                  quiet=True)["object"]["sha"]
+        api("POST", "/repos/%s/git/refs" % REPO,
+            {"ref": "refs/heads/" + BRANCH, "sha": sha})
+        print("  已把 %s 指向该根提交" % BRANCH)
+    return True
+
+
 def main():
     mapping = load_map()
     remote_to_local = {v: k for k, v in mapping.items()}
+
+    ensure_commits_exist()
 
     try:
         head = api("GET", "/repos/%s/git/ref/heads/%s" % (REPO, BRANCH),
