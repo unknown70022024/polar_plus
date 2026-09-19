@@ -18,6 +18,11 @@ light.sources.eumetsat_li — EUMETSAT MTG-I1 闪电成像仪（LI）Level 2 闪
 
 变量名做了防御式自动探测：不同产品（LFL/LGR/LEF）的经纬度变量名可能不同，
 所以按正则匹配而不是硬编码；首次实跑时把探测结果打进日志。
+
+质量变量的**极性不统一**，这是这里最容易踩的坑：flash_filter_confidence
+是 0 = 高可信、1 = 低可信；而同一份规范里的 group_filter_qa 是 0 = 低可信、
+1 = 最高可信。自动探测到哪个变量，过滤方向就得跟着变（见 config.py 里的
+EUMETSAT_MAX_FILTER_CONFIDENCE）。
 """
 from __future__ import annotations
 
@@ -220,17 +225,28 @@ def _parse_body(blob: bytes, tag: str) -> list[tuple[float, float, str, float]]:
     mask = (lat_ok[:n] & lon_ok[:n]
             & np.isfinite(lat) & np.isfinite(lon)
             & (lat >= -90) & (lat <= 90) & (lon >= -180) & (lon <= 180))
+    conf_max = config.EUMETSAT_MAX_FILTER_CONFIDENCE
     if conf is not None and conf_ok is not None and conf.size >= n:
         c = conf[:n]
         mask &= conf_ok[:n] & np.isfinite(c)
-        if config.EUMETSAT_MIN_CONFIDENCE > 0:
-            # flash_filter_confidence 已按 scale_factor 展开到 0..1
-            mask &= c >= config.EUMETSAT_MIN_CONFIDENCE
+        # flash_filter_confidence 的极性是反的：规范里 0 = 高可信的真闪击、
+        # 1 = 低可信（见 config.py 里那段说明）。所以这里过滤要保留"数值小"
+        # 的那部分，用 <= 而不是 >=。写成 >= 会把 84% 的高可信闪击全丢掉，
+        # 只剩仪器自己标为最可疑的那 6%。
+        # 顺便把分档打出来 —— 这个变量通常只有两三个离散值，看不到分布
+        # 就很容易再一次判断错方向。
+        logger.info("EUMETSAT: 置信度分档 %s（0=高可信，1=低可信）",
+                    [round(float(v), 3) for v in np.unique(c)])
+        if conf_max < 1.0:
+            mask &= c <= conf_max
     kept, total = int(mask.sum()), int(n)
     lat, lon = lat[mask], lon[mask]
-    logger.info("EUMETSAT: 置信度过滤 %.2f -> 保留 %d/%d (%.0f%%)",
-                config.EUMETSAT_MIN_CONFIDENCE, kept, total,
-                100.0 * kept / max(total, 1))
+    if conf is None or conf_ok is None or conf.size < n:
+        logger.info("EUMETSAT: 产品里没有可用的置信度变量，不做过滤 -> %d/%d",
+                    kept, total)
+    else:
+        logger.info("EUMETSAT: 保留置信度 <= %.2f -> %d/%d (%.0f%%)",
+                    conf_max, kept, total, 100.0 * kept / max(total, 1))
     logger.info("EUMETSAT: %s -> %d 个闪击（lat=%s lon=%s qual=%s）",
                 tag, lat.size, lat_name, lon_name, qual_name)
     return [(float(a), float(b), "mtg-li", 1.0) for a, b in zip(lat, lon)]

@@ -201,11 +201,28 @@ EUMETSAT_TIMEOUT = _env_int("EUMETSAT_TIMEOUT", 60)   # 单产品总时长上限
 EUMETSAT_CONCURRENCY = _env_int("EUMETSAT_CONCURRENCY", 8)
 EUMETSAT_MAX_PRODUCTS = _env_int("EUMETSAT_MAX_PRODUCTS", 12)   # 60min/10min = 6，留余量
 
-# 闪击置信度下限（flash_filter_confidence 已展开到 0..1）。
-# 实测一个 10 分钟的全圆盘产品有 3.4 万个闪击 —— 折合约 56 次/秒，
-# 而全球平均只有约 44 次/秒，说明其中有大量低置信度的误检。
-# 设 0 表示不过滤，便于先看原始分布再定阈值。
-EUMETSAT_MIN_CONFIDENCE = _env_float("EUMETSAT_MIN_CONFIDENCE", 0.5)
+# flash_filter_confidence 的**上限** —— 注意这个变量的极性与直觉相反。
+#
+# MTG LI Level 2 格式规范对它的定义是：
+#   "Confidence value derived from the L2 flash filtering process, in the
+#    range 0-1 where 0 means high confidence of a true flash and 1 means
+#    low confidence of a true flash"
+# 也就是 **0 才是可信**，1 是最不可信。
+#
+# 实测一个真实的 10 分钟全圆盘产品，这个变量只有三个离散取值：
+#     原始 0   -> 0.000   84.32%   高可信
+#     原始 13  -> 0.052    9.47%   高可信
+#     原始 250 -> 1.000    6.21%   低可信
+# 所以它实际是个三选一的分档开关，落在 (0.052, 1.0] 里的任何阈值行为完全一样。
+#
+# 因此这里配的是"允许差到什么程度"的上限，过滤条件用 c <= 阈值：
+# 默认 0.5 表示丢掉最差的一档、保留 93.8%；设 >= 1.0 表示完全不过滤。
+#
+# 历史教训：这里原本叫 EUMETSAT_MIN_CONFIDENCE 且写成 c >= 阈值，等于
+# 只保留仪器判定为最不可信的 6.2%、把 84% 的高可信闪击全部丢掉。又因为
+# 低可信那一档在数据里集中在欧洲，它还让欧洲看起来比非洲闪电更多。
+EUMETSAT_MAX_FILTER_CONFIDENCE = _env_float(
+    "EUMETSAT_MAX_FILTER_CONFIDENCE", 0.5)
 
 EUMETSAT_KEY = os.environ.get("EUMETSAT_CONSUMER_KEY", "").strip()
 EUMETSAT_SECRET = os.environ.get("EUMETSAT_CONSUMER_SECRET", "").strip()
